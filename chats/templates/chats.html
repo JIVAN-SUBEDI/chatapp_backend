@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Chat Backend Test</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f3f4f6;
+      padding: 20px;
+    }
+
+    .box {
+      background: white;
+      padding: 16px;
+      margin-bottom: 16px;
+      border-radius: 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+
+    input, textarea, select, button {
+      width: 100%;
+      padding: 10px;
+      margin-top: 8px;
+      margin-bottom: 8px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+    }
+
+    button {
+      background: #2563eb;
+      color: white;
+      cursor: pointer;
+      font-weight: bold;
+    }
+
+    button:hover {
+      background: #1d4ed8;
+    }
+
+    #messages {
+      height: 300px;
+      overflow-y: auto;
+      background: #111827;
+      color: white;
+      padding: 12px;
+      border-radius: 10px;
+    }
+
+    .msg {
+      background: #374151;
+      margin-bottom: 8px;
+      padding: 8px;
+      border-radius: 8px;
+    }
+
+    .success {
+      color: green;
+    }
+
+    .error {
+      color: red;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h1>Chat Backend Test Page</h1>
+
+  <div class="box">
+    <h2>Auth</h2>
+
+    <label>Access Token</label>
+    <textarea id="token" rows="3" placeholder="Paste JWT access token here"></textarea>
+
+    <button onclick="saveToken()">Save Token</button>
+
+    <p id="tokenStatus"></p>
+  </div>
+
+  <div class="box">
+    <h2>Start Private Chat</h2>
+
+    <input id="privateUserId" type="number" placeholder="Other user ID">
+
+    <button onclick="startPrivateChat()">Start Private Chat</button>
+
+    <pre id="privateResult"></pre>
+  </div>
+
+  <div class="box">
+    <h2>Create Group Chat</h2>
+
+    <input id="groupName" placeholder="Group name">
+
+    <input id="groupMembers" placeholder="Member IDs example: 2,3,4">
+
+    <button onclick="createGroup()">Create Group</button>
+
+    <pre id="groupResult"></pre>
+  </div>
+
+  <div class="box">
+    <h2>Conversations</h2>
+
+    <button onclick="getConversations()">Load Conversations</button>
+
+    <pre id="conversationResult"></pre>
+  </div>
+
+  <div class="box">
+    <h2>Messages</h2>
+
+    <input id="conversationId" type="number" placeholder="Conversation ID">
+
+    <button onclick="getMessages()">Load Messages</button>
+
+    <pre id="messageResult"></pre>
+  </div>
+
+  <div class="box">
+    <h2>Send Message REST</h2>
+
+    <input id="sendConversationId" type="number" placeholder="Conversation ID">
+
+    <select id="messageType">
+      <option value="text">Text</option>
+      <option value="reply">Reply</option>
+      <option value="reaction">Reaction</option>
+      <option value="image">Image</option>
+      <option value="video">Video</option>
+      <option value="audio">Audio</option>
+      <option value="file">File</option>
+    </select>
+
+    <textarea id="messageText" placeholder="Message text"></textarea>
+
+    <input id="replyTo" type="number" placeholder="Reply to message ID optional">
+
+    <input id="reactionTo" type="number" placeholder="Reaction to message ID optional">
+
+    <input id="reaction" placeholder="Reaction emoji optional">
+
+    <input id="mediaFile" type="file">
+
+    <button onclick="sendMessageRest()">Send Message</button>
+
+    <pre id="sendResult"></pre>
+  </div>
+
+  <div class="box">
+    <h2>WebSocket Chat</h2>
+
+    <input id="wsConversationId" type="number" placeholder="Conversation ID">
+
+    <button onclick="connectSocket()">Connect WebSocket</button>
+
+    <button onclick="disconnectSocket()">Disconnect</button>
+
+    <textarea id="wsText" placeholder="WebSocket message"></textarea>
+
+    <button onclick="sendSocketMessage()">Send WebSocket Message</button>
+
+    <button onclick="sendTyping()">Send Typing</button>
+
+    <div id="messages"></div>
+  </div>
+
+<script>
+  const API_BASE = "/api/chat/";
+  let socket = null;
+
+  function getToken() {
+    return localStorage.getItem("access_token");
+  }
+
+  function saveToken() {
+    const token = document.getElementById("token").value.trim();
+    localStorage.setItem("access_token", token);
+    document.getElementById("tokenStatus").innerHTML =
+      "<span class='success'>Token saved</span>";
+  }
+
+  function headersJson() {
+    return {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + getToken()
+    };
+  }
+
+  async function startPrivateChat() {
+    const userId = document.getElementById("privateUserId").value;
+
+    const res = await fetch(API_BASE + "private/start/", {
+      method: "POST",
+      headers: headersJson(),
+      body: JSON.stringify({
+        user_id: userId
+      })
+    });
+
+    const data = await res.json();
+    document.getElementById("privateResult").textContent =
+      JSON.stringify(data, null, 2);
+  }
+
+  async function createGroup() {
+    const name = document.getElementById("groupName").value;
+    const membersRaw = document.getElementById("groupMembers").value;
+
+    const memberIds = membersRaw
+      .split(",")
+      .map(id => parseInt(id.trim()))
+      .filter(Boolean);
+
+    const res = await fetch(API_BASE + "groups/create/", {
+      method: "POST",
+      headers: headersJson(),
+      body: JSON.stringify({
+        name: name,
+        member_ids: memberIds
+      })
+    });
+
+    const data = await res.json();
+    document.getElementById("groupResult").textContent =
+      JSON.stringify(data, null, 2);
+  }
+
+  async function getConversations() {
+    const res = await fetch(API_BASE + "conversations/", {
+      headers: headersJson()
+    });
+
+    const data = await res.json();
+    document.getElementById("conversationResult").textContent =
+      JSON.stringify(data, null, 2);
+  }
+
+  async function getMessages() {
+    const conversationId = document.getElementById("conversationId").value;
+
+    const res = await fetch(API_BASE + `conversations/${conversationId}/messages/`, {
+      headers: headersJson()
+    });
+
+    const data = await res.json();
+    document.getElementById("messageResult").textContent =
+      JSON.stringify(data, null, 2);
+  }
+
+  async function sendMessageRest() {
+    const conversationId = document.getElementById("sendConversationId").value;
+    const messageType = document.getElementById("messageType").value;
+    const text = document.getElementById("messageText").value;
+    const replyTo = document.getElementById("replyTo").value;
+    const reactionTo = document.getElementById("reactionTo").value;
+    const reaction = document.getElementById("reaction").value;
+    const media = document.getElementById("mediaFile").files[0];
+
+    const formData = new FormData();
+    formData.append("message_type", messageType);
+    formData.append("text", text);
+
+    if (replyTo) formData.append("reply_to", replyTo);
+    if (reactionTo) formData.append("reaction_to", reactionTo);
+    if (reaction) formData.append("reaction", reaction);
+    if (media) formData.append("media", media);
+
+    const res = await fetch(API_BASE + `conversations/${conversationId}/send/`, {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + getToken()
+      },
+      body: formData
+    });
+
+    const data = await res.json();
+    document.getElementById("sendResult").textContent =
+      JSON.stringify(data, null, 2);
+  }
+
+  function connectSocket() {
+    const conversationId = document.getElementById("wsConversationId").value;
+    const token = getToken();
+
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+
+    socket = new WebSocket(
+      `${protocol}://${window.location.host}/ws/chat/${conversationId}/?token=${token}`
+    );
+
+    socket.onopen = function () {
+      addMessage("Connected to WebSocket");
+    };
+
+    socket.onmessage = function (event) {
+      const data = JSON.parse(event.data);
+      addMessage(JSON.stringify(data, null, 2));
+    };
+
+    socket.onerror = function () {
+      addMessage("WebSocket error");
+    };
+
+    socket.onclose = function () {
+      addMessage("WebSocket closed");
+    };
+  }
+
+  function disconnectSocket() {
+    if (socket) {
+      socket.close();
+    }
+  }
+
+  function sendSocketMessage() {
+    const text = document.getElementById("wsText").value;
+
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      addMessage("Socket is not connected");
+      return;
+    }
+
+    socket.send(JSON.stringify({
+      action: "send_message",
+      message_type: "text",
+      text: text
+    }));
+
+    document.getElementById("wsText").value = "";
+  }
+
+  function sendTyping() {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      addMessage("Socket is not connected");
+      return;
+    }
+
+    socket.send(JSON.stringify({
+      action: "typing",
+      is_typing: true
+    }));
+  }
+
+  function addMessage(message) {
+    const box = document.getElementById("messages");
+
+    const div = document.createElement("div");
+    div.className = "msg";
+    div.textContent = message;
+
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+  }
+</script>
+
+</body>
+</html>

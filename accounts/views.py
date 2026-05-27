@@ -2,7 +2,9 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import permissions
 from rest_framework_simplejwt.tokens import RefreshToken
-
+from rest_framework import status
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
 from .serializers import SendOTPSerializer, VerifyOTPSerializer, CompleteSignupSerializer
 from .utils import make_signup_token,read_signup_token
 def jwt_tokens(user):
@@ -56,10 +58,14 @@ class VerifyOTPView(APIView):
         })
 
 class CompleteSignupView(APIView):
+    authentication_classes = []
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
+        print(request)
         auth = request.headers.get("Authorization", "")
+        print(auth)
+        print(auth)
         if not auth.startswith("Bearer "):
             return Response({"detail": "Missing signup token"}, status=401)
 
@@ -98,3 +104,24 @@ class MeView(APIView):
             "full_name": u.full_name,
             "bio": u.bio,
         })
+class EditProfileView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def patch(self, request):
+        user = request.user
+
+        user.full_name = request.data.get("full_name", user.full_name)
+        user.bio = request.data.get("bio", user.bio)
+        user.save()
+
+        return Response({
+            "success": True,
+            "user": {
+                "id": str(user.id),
+                "phone": user.phone,
+                "full_name": user.full_name,
+                "bio": user.bio,
+            }
+        })
+
+

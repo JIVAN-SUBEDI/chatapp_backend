@@ -16,9 +16,16 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path,include
+from django.conf.urls.static import static
+from django.conf import settings
+from chats.views import chat_test_page
+from rest_framework_simplejwt.views import TokenRefreshView
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/accounts/',include('accounts.urls'))
-
+    path('api/accounts/',include('accounts.urls')),
+    path("api/chat/", include("chats.urls")),
+    path("/",chat_test_page),
+    path("api/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
 ]
+urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
