@@ -9,6 +9,8 @@ from rest_framework.views import APIView
 from .models import Conversation, ConversationMember, Message
 from .serializers import ConversationSerializer, MessageSerializer
 from django.shortcuts import render
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
 User = get_user_model()
 
 
@@ -198,29 +200,38 @@ class ConversationMessagesView(generics.ListAPIView):
         )
 
 
-from channels.layers import get_channel_layer
-from asgiref.sync import async_to_sync
+
 
 class SendMessageView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, conversation_id):
-        is_member = ConversationMember.objects.filter(
+        member = ConversationMember.objects.filter(
             conversation_id=conversation_id,
             user=request.user
-        ).exists()
+        ).first()
 
-        if not is_member:
+        if not member:
             return Response({"error": "You are not a member"}, status=403)
+
+        if member.is_blocked:
+            return Response(
+                {"error": "You are blocked in this chat"},
+                status=403
+            )
+
+        conversation = member.conversation
 
         media = request.FILES.get("media")
         message_type = request.data.get("message_type")
 
         if not message_type:
             message_type = detect_message_type(media)
+        
+        # message = request.data.get("text",)
 
         message = Message.objects.create(
-            conversation_id=conversation_id,
+            conversation=conversation,
             sender=request.user,
             message_type=message_type,
             text=request.data.get("text", ""),
@@ -237,12 +248,10 @@ class SendMessageView(APIView):
 
         message.read_by.add(request.user)
 
-        conversation = message.conversation
         conversation.save()
 
         data = MessageSerializer(message, context={"request": request}).data
 
-        # SEND MESSAGE TO WEBSOCKET GROUP
         channel_layer = get_channel_layer()
 
         async_to_sync(channel_layer.group_send)(
@@ -364,3 +373,51 @@ class SearchUserByPhoneView(APIView):
                 {"error": "User not found"},
                 status=404
             )
+class UpdateMemberNicknameView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def patch(self, request, conversation_id, user_id):
+        if not ConversationMember.objects.filter(
+            conversation_id=conversation_id,
+            user=request.user
+        ).exists():
+            return Response({"error": "You are not a member"}, status=403)
+
+        member = ConversationMember.objects.filter(
+            conversation_id=conversation_id,
+            user_id=user_id
+        ).first()
+
+        if not member:
+            return Response({"error": "Member not found"}, status=404)
+
+        member.nickname = request.data.get("nickname", "")
+        member.save()
+
+        return Response({"success": True, "nickname": member.nickname})
+class BlockGroupMemberView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, conversation_id, user_id):
+        is_admin = ConversationMember.objects.filter(
+            conversation_id=conversation_id,
+            user=request.user,
+            is_admin=True
+        ).exists()
+
+        if not is_admin:
+            return Response({"error": "Only admin can block members"}, status=403)
+
+        member = ConversationMember.objects.filter(
+            conversation_id=conversation_id,
+            user_id=user_id
+        ).first()
+
+        if not member:
+            return Response({"error": "Member not found"}, status=404)
+
+        member.is_blocked = True
+        member.blocked_by = request.user
+        member.save()
+
+        return Response({"success": True})

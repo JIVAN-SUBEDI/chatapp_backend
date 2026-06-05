@@ -7,7 +7,6 @@ from .models import ConversationMember
 
 User = get_user_model()
 
-
 CALL_OFFER = "call_offer"
 CALL_ANSWER = "call_answer"
 ICE_CANDIDATE = "ice_candidate"
@@ -15,6 +14,11 @@ CALL_REJECT = "call_reject"
 CALL_END = "call_end"
 CALL_JOIN = "call_join"
 CALL_LEAVE = "call_leave"
+
+# ADD THESE FOR AUDIO <-> VIDEO SWITCH
+CALL_RENEGOTIATE_OFFER = "call_renegotiate_offer"
+CALL_RENEGOTIATE_ANSWER = "call_renegotiate_answer"
+CALL_VIDEO_TOGGLE = "call_video_toggle"
 
 
 class CallSignalingConsumer(AsyncWebsocketConsumer):
@@ -80,9 +84,7 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
         try:
             data = json.loads(text_data or "{}")
         except json.JSONDecodeError:
-            await self.send_json({
-                "error": "Invalid JSON"
-            })
+            await self.send_json({"error": "Invalid JSON"})
             return
 
         event = data.get("event")
@@ -97,12 +99,15 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
             CALL_END,
             CALL_JOIN,
             CALL_LEAVE,
+
+            # audio/video switch events
+            CALL_RENEGOTIATE_OFFER,
+            CALL_RENEGOTIATE_ANSWER,
+            CALL_VIDEO_TOGGLE,
         ]
 
         if event not in allowed_events:
-            await self.send_json({
-                "error": "Invalid call event"
-            })
+            await self.send_json({"error": "Invalid call event"})
             return
 
         await self.channel_layer.group_send(

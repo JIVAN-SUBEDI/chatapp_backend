@@ -76,10 +76,32 @@ class MessageSerializer(serializers.ModelSerializer):
 
 class ConversationMemberSerializer(serializers.ModelSerializer):
     user = UserMiniSerializer(read_only=True)
+    display_name = serializers.SerializerMethodField()
+    blocked_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = ConversationMember
-        fields = ["id", "user", "is_admin", "is_muted", "joined_at"]
+        fields = [
+            "id",
+            "user",
+            "nickname",
+            "display_name",
+            "is_admin",
+            "is_muted",
+            "is_blocked",
+            "blocked_by",
+            "blocked_by_name",
+            "joined_at",
+        ]
+
+    def get_display_name(self, obj):
+        return obj.nickname or obj.user.full_name
+
+    def get_blocked_by_name(self, obj):
+        if not obj.blocked_by:
+            return None
+        return obj.blocked_by.full_name
+
 
 
 class ConversationSerializer(serializers.ModelSerializer):

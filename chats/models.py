@@ -50,12 +50,21 @@ class ConversationMember(models.Model):
     is_admin = models.BooleanField(default=False)
     is_muted = models.BooleanField(default=False)
     joined_at = models.DateTimeField(auto_now_add=True)
-
+    nickname = models.CharField(max_length=100, blank=True, null=True)
+    is_blocked = models.BooleanField(default=False)
+    blocked_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="blocked_chat_members"
+    )
     class Meta:
         unique_together = ("conversation", "user")
 
     def __str__(self):
         return f"{self.user} in {self.conversation}"
+
 
 
 class Message(models.Model):
