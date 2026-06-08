@@ -10,15 +10,16 @@ User = get_user_model()
 CALL_OFFER = "call_offer"
 CALL_ANSWER = "call_answer"
 ICE_CANDIDATE = "ice_candidate"
+
 CALL_REJECT = "call_reject"
 CALL_END = "call_end"
-CALL_JOIN = "call_join"
-CALL_LEAVE = "call_leave"
+CALL_BUSY = "call_busy"
+CALL_TIMEOUT = "call_timeout"
 
-# ADD THESE FOR AUDIO <-> VIDEO SWITCH
 CALL_RENEGOTIATE_OFFER = "call_renegotiate_offer"
 CALL_RENEGOTIATE_ANSWER = "call_renegotiate_answer"
 CALL_VIDEO_TOGGLE = "call_video_toggle"
+CALL_VIDEO_UPGRADE_REJECTED = "call_video_upgrade_rejected"
 
 
 class CallSignalingConsumer(AsyncWebsocketConsumer):
@@ -32,7 +33,7 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
 
         is_member = await self.is_conversation_member(
             self.conversation_id,
-            self.user.id
+            self.user.id,
         )
 
         if not is_member:
@@ -43,41 +44,16 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
 
         await self.channel_layer.group_add(
             self.room_group_name,
-            self.channel_name
+            self.channel_name,
         )
 
         await self.accept()
 
-        await self.channel_layer.group_send(
-            self.room_group_name,
-            {
-                "type": "call_signal",
-                "event": CALL_JOIN,
-                "from_user": self.user.id,
-                "payload": {
-                    "user_id": self.user.id,
-                    "name": self.get_user_name(),
-                },
-            }
-        )
-
     async def disconnect(self, close_code):
         if hasattr(self, "room_group_name"):
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {
-                    "type": "call_signal",
-                    "event": CALL_LEAVE,
-                    "from_user": self.user.id,
-                    "payload": {
-                        "user_id": self.user.id,
-                    },
-                }
-            )
-
             await self.channel_layer.group_discard(
                 self.room_group_name,
-                self.channel_name
+                self.channel_name,
             )
 
     async def receive(self, text_data=None, bytes_data=None):
@@ -88,27 +64,36 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
             return
 
         event = data.get("event")
-        payload = data.get("payload", {})
+        payload = data.get("payload") or {}
         target_user = data.get("target_user")
+        conversation_id = data.get("conversation_id") or self.conversation_id
 
-        allowed_events = [
+        allowed_events = {
             CALL_OFFER,
             CALL_ANSWER,
             ICE_CANDIDATE,
             CALL_REJECT,
             CALL_END,
-            CALL_JOIN,
-            CALL_LEAVE,
-
-            # audio/video switch events
+            CALL_BUSY,
+            CALL_TIMEOUT,
             CALL_RENEGOTIATE_OFFER,
             CALL_RENEGOTIATE_ANSWER,
             CALL_VIDEO_TOGGLE,
-        ]
+            CALL_VIDEO_UPGRADE_REJECTED,
+        }
 
         if event not in allowed_events:
-            await self.send_json({"error": "Invalid call event"})
+            await self.send_json({
+                "error": "Invalid call event",
+                "event": event,
+            })
             return
+
+        if not isinstance(payload, dict):
+            payload = {}
+
+        payload.setdefault("from", str(self.user.id))
+        payload.setdefault("conversation_id", str(conversation_id))
 
         await self.channel_layer.group_send(
             self.room_group_name,
@@ -116,40 +101,37 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
                 "type": "call_signal",
                 "event": event,
                 "from_user": self.user.id,
-                "target_user": target_user,
+                "target_user": str(target_user) if target_user is not None else None,
+                "conversation_id": str(conversation_id),
                 "payload": payload,
-            }
+            },
         )
 
     async def call_signal(self, event):
-        if event.get("from_user") == self.user.id:
+        from_user = event.get("from_user")
+
+        if str(from_user) == str(self.user.id):
             return
 
         target_user = event.get("target_user")
 
-        if target_user and int(target_user) != self.user.id:
+        if target_user is not None and str(target_user) != str(self.user.id):
             return
 
         await self.send_json({
             "event": event["event"],
-            "from_user": event["from_user"],
+            "from_user": from_user,
             "target_user": target_user,
+            "conversation_id": event.get("conversation_id"),
             "payload": event.get("payload", {}),
         })
 
     async def send_json(self, data):
         await self.send(text_data=json.dumps(data))
 
-    def get_user_name(self):
-        return (
-            getattr(self.user, "full_name", None)
-            or getattr(self.user, "username", "")
-            or str(self.user.id)
-        )
-
     @database_sync_to_async
     def is_conversation_member(self, conversation_id, user_id):
         return ConversationMember.objects.filter(
             conversation_id=conversation_id,
-            user_id=user_id
+            user_id=user_id,
         ).exists()

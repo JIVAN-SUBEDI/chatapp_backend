@@ -25,7 +25,7 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/accounts/',include('accounts.urls')),
     path("api/chat/", include("chats.urls")),
-    path("/",chat_test_page),
+    path("",chat_test_page),
     path("api/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
 ]
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

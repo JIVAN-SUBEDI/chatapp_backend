@@ -158,3 +158,67 @@ class Message(models.Model):
 
     def __str__(self):
         return f"{self.sender} - {self.message_type}"
+    
+
+class UserFCMToken(models.Model):
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="fcm_tokens",
+    )
+    token = models.TextField(unique=True)
+    device_id = models.CharField(max_length=255, blank=True, null=True)
+    platform = models.CharField(max_length=30, blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.user_id} - {self.platform}"
+
+
+class CallSession(models.Model):
+    AUDIO = "audio"
+    VIDEO = "video"
+
+    CALL_TYPES = (
+        (AUDIO, "Audio"),
+        (VIDEO, "Video"),
+    )
+
+    RINGING = "ringing"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    ENDED = "ended"
+    MISSED = "missed"
+
+    STATUS_CHOICES = (
+        (RINGING, "Ringing"),
+        (ACCEPTED, "Accepted"),
+        (REJECTED, "Rejected"),
+        (ENDED, "Ended"),
+        (MISSED, "Missed"),
+    )
+
+    conversation_id = models.IntegerField()
+    caller = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="outgoing_calls",
+    )
+    receiver = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="incoming_calls",
+    )
+    call_type = models.CharField(max_length=10, choices=CALL_TYPES)
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=RINGING,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    answered_at = models.DateTimeField(blank=True, null=True)
+    ended_at = models.DateTimeField(blank=True, null=True)
+
+    def __str__(self):
+        return f"{self.caller_id} -> {self.receiver_id} ({self.call_type})"

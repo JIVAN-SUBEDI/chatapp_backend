@@ -98,10 +98,17 @@ class MeView(APIView):
 
     def get(self, request):
         u = request.user
+        image = getattr(u, "profile_picture", None)
+        image_url = ""
+        if image:
+            image_url = request.build_absolute_uri(image.url)
+             
+        
         return Response({
             "id": str(u.id),
             "phone": u.phone,
             "full_name": u.full_name,
+            "profile_picture":image_url,
             "bio": u.bio,
         })
 class EditProfileView(APIView):
@@ -110,9 +117,30 @@ class EditProfileView(APIView):
     def patch(self, request):
         user = request.user
 
-        user.full_name = request.data.get("full_name", user.full_name)
-        user.bio = request.data.get("bio", user.bio)
+        user.full_name = request.data.get(
+            "full_name",
+            user.full_name,
+        )
+
+        user.bio = request.data.get(
+            "bio",
+            user.bio,
+        )
+
+        if "profile_picture" in request.FILES:
+            user.profile_picture = request.FILES["profile_picture"]
+
         user.save()
+
+        profile_picture_url = ""
+
+        if user.profile_picture:
+            try:
+                profile_picture_url = request.build_absolute_uri(
+                    user.profile_picture.url
+                )
+            except Exception:
+                profile_picture_url = user.profile_picture.url
 
         return Response({
             "success": True,
@@ -121,6 +149,7 @@ class EditProfileView(APIView):
                 "phone": user.phone,
                 "full_name": user.full_name,
                 "bio": user.bio,
+                "profile_picture": profile_picture_url,
             }
         })
 

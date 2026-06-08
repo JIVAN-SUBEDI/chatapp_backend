@@ -8,7 +8,7 @@ User = get_user_model()
 class UserMiniSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ["id", "phone","full_name"]
+        fields = ["id", "phone","full_name","profile_picture"]
 
 
 class MessageSerializer(serializers.ModelSerializer):
