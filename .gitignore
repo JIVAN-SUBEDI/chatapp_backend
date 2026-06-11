@@ -1,0 +1,49 @@
+
+1. Remove duplicate `media/`
+2. Use `chats/firebase_chat.json` instead of `./chats/firebase_chat.json`
+3. Add `.firebase/` if you also want to ignore Firebase local cache folder
+
+Use this final `.gitignore`:
+
+```gitignore
+# Database
+db.sqlite3
+*.sqlite3
+*.db
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Firebase
+.firebase/
+chats/firebase_chat.json
+firebase-debug.log
+
+# Media uploads
+media/
+uploads/
+
+# Python / Django
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+local_settings.py
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Static files generated
+staticfiles/
+collected_static/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
