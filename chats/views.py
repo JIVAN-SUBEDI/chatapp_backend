@@ -11,7 +11,7 @@ from .serializers import ConversationSerializer, MessageSerializer
 from django.shortcuts import render
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
-from .firebase import send_incoming_call_push
+from .firebase import send_incoming_call_push,send_message_push
 from django.utils import timezone
 
 User = get_user_model()
@@ -306,8 +306,6 @@ class SendMessageView(APIView):
 
         if not message_type:
             message_type = detect_message_type(media)
-        
-        # message = request.data.get("text",)
 
         message = Message.objects.create(
             conversation=conversation,
@@ -329,7 +327,10 @@ class SendMessageView(APIView):
 
         conversation.save()
 
-        data = MessageSerializer(message, context={"request": request}).data
+        data = MessageSerializer(
+            message,
+            context={"request": request}
+        ).data
 
         channel_layer = get_channel_layer()
 
@@ -340,6 +341,81 @@ class SendMessageView(APIView):
                 "message": data,
             }
         )
+
+        # -------------------------------
+        # FCM PUSH NOTIFICATION FOR MESSAGE
+        # -------------------------------
+
+        sender_name = (
+            getattr(request.user, "full_name", None)
+            or getattr(request.user, "name", None)
+            or getattr(request.user, "username", "")
+            or str(request.user.id)
+        )
+
+        sender_avatar = ""
+
+        profile_picture = getattr(request.user, "profile_picture", None)
+        if profile_picture:
+            try:
+                sender_avatar = request.build_absolute_uri(profile_picture.url)
+            except Exception:
+                sender_avatar = ""
+
+        if message.message_type == Message.TEXT:
+            body = message.text or "New message"
+        elif message.message_type == Message.IMAGE:
+            body = "Sent an image"
+        elif message.message_type == Message.VIDEO:
+            body = "Sent a video"
+        elif message.message_type == Message.AUDIO:
+            body = "Sent an audio"
+        else:
+            body = "Sent a file"
+
+        # For group chat, title can be group name
+        if conversation.type == Conversation.GROUP:
+            title = conversation.name or sender_name
+            body = f"{sender_name}: {body}"
+        else:
+            title = sender_name
+
+        message_data = {
+            "title": title,
+            "body": body,
+            "conversation_id": conversation.id,
+            "message_id": message.id,
+            "sender_id": request.user.id,
+            "sender_name": sender_name,
+            "sender_avatar": sender_avatar,
+            "message_type": message.message_type,
+            "text": message.text or "",
+        }
+
+        receiver_members = ConversationMember.objects.filter(
+            conversation=conversation,
+            is_blocked=False
+        ).exclude(
+            user=request.user
+        )
+
+        receiver_ids = receiver_members.values_list("user_id", flat=True)
+        print(receiver_ids)
+
+        tokens = UserFCMToken.objects.filter(
+            user_id__in=receiver_ids,
+        )
+        print(tokens)
+        for item in tokens:
+            print(item.token)
+            try:
+                send_message_push(
+                    token=item.token,
+                    message_data=message_data,
+                )
+            except Exception:
+                item.is_active = False
+                item.save(update_fields=["is_active"])
 
         return Response(data, status=status.HTTP_201_CREATED)
 
@@ -742,7 +818,7 @@ class StartCallView(APIView):
 
         tokens = UserFCMToken.objects.filter(
             user=receiver,
-            is_active=True,
+            # is_active=True,
         )
 
         sent = 0
@@ -786,7 +862,7 @@ class UpdateCallStatusView(APIView):
                 {"error": "Not allowed"},
                 status=status.HTTP_403_FORBIDDEN,
             )
-
+        print(action)
         if action == "accept":
             call.status = CallSession.ACCEPTED
             call.answered_at = timezone.now()
@@ -795,7 +871,7 @@ class UpdateCallStatusView(APIView):
             call.status = CallSession.REJECTED
             call.ended_at = timezone.now()
 
-        elif action == "end":
+        elif action == "ended":
             call.status = CallSession.ENDED
             call.ended_at = timezone.now()
 
