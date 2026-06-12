@@ -231,7 +231,7 @@ FIREBASE_CREDENTIALS = BASE_DIR / "chats/firebase_chat.json"
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
+TWILIO_VERIFY_SERVICE_SID = os.getenv("TWILIO_VERIFY_SERVICE_SID", "").strip()
 
 # Default false is safer.
 # If credentials are missing, API will not break; OTP prints in terminal.

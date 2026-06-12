@@ -13,10 +13,14 @@ from .models import PhoneChangeOTP
 
 OTP_TTL_SECONDS = 300          # 5 minutes
 RESEND_COOLDOWN_SECONDS = 60   # 60 seconds
+MAX_OTP_ATTEMPTS = 5
 
 User = get_user_model()
 
 E164_REGEX = re.compile(r"^\+[1-9]\d{7,14}$")
+
+LOCAL_OTP_PREFIX = "local:"
+TWILIO_VERIFY_PREFIX = "twilio_verify:"
 
 
 def normalize_phone(phone: str) -> str:
@@ -34,85 +38,129 @@ def normalize_e164(phone: str) -> str:
     return phone
 
 
-def send_otp_sms(*, phone: str, code: str, purpose: str = "login") -> None:
+def twilio_verify_enabled() -> bool:
     """
-    Sends OTP using Twilio.
-
-    Required settings:
-      TWILIO_ACCOUNT_SID
-      TWILIO_AUTH_TOKEN
-      TWILIO_PHONE_NUMBER
-      TWILIO_ENABLE_SMS
-
-    For local/dev:
-      TWILIO_ENABLE_SMS=false
+    True = production Twilio Verify SMS.
+    False = local/dev mode. OTP is printed in the console.
     """
+    return bool(getattr(settings, "TWILIO_ENABLE_SMS", False))
+
+
+def get_twilio_verify_client():
+    account_sid = getattr(settings, "TWILIO_ACCOUNT_SID", "")
+    auth_token = getattr(settings, "TWILIO_AUTH_TOKEN", "")
+    service_sid = getattr(settings, "TWILIO_VERIFY_SERVICE_SID", "")
+
+    if not account_sid or not auth_token or not service_sid:
+        raise serializers.ValidationError({
+            "phone": "Twilio Verify service is not configured properly."
+        })
+
+    return Client(account_sid, auth_token), service_sid
+
+
+def start_otp_verification(*, phone: str, purpose: str = "login") -> str:
 
     phone = normalize_e164(phone)
 
-    sms_enabled = getattr(settings, "TWILIO_ENABLE_SMS", False)
-
-    if not sms_enabled:
-        print(f"DEV OTP [{purpose}]:", phone, code)
-        return
-
-    account_sid = getattr(settings, "TWILIO_ACCOUNT_SID", "")
-    auth_token = getattr(settings, "TWILIO_AUTH_TOKEN", "")
-    from_number = getattr(settings, "TWILIO_PHONE_NUMBER", "")
-
-    print("========== TWILIO DEBUG ==========")
-    print("purpose:", purpose)
-    print("to:", phone)
-    print("from:", from_number)
-    print("sid exists:", bool(account_sid))
-    print("token exists:", bool(auth_token))
-    print("sms enabled:", sms_enabled)
-    print("==================================")
-
-    if not account_sid or not auth_token or not from_number:
-        raise serializers.ValidationError({
-            "phone": "SMS service is not configured properly."
-        })
-
-    if not from_number.startswith("+"):
-        raise serializers.ValidationError({
-            "phone": "Twilio sender number must be in E.164 format, e.g. +1234567890."
-        })
-
-    message_body = f"Your OTP code is {code}. It expires in 5 minutes."
+    if not twilio_verify_enabled():
+        code = f"{random.randint(100000, 999999)}"
+        print(f"DEV OTP [{purpose}]: {phone} -> {code}")
+        return LOCAL_OTP_PREFIX + make_password(code)
 
     try:
-        client = Client(account_sid, auth_token)
+        client, service_sid = get_twilio_verify_client()
 
-        message = client.messages.create(
-            body=message_body,
-            from_=from_number,
+        print("========== TWILIO VERIFY DEBUG ==========")
+        print("purpose:", purpose)
+        print("to:", phone)
+        print("service sid exists:", bool(service_sid))
+        print("verify enabled:", twilio_verify_enabled())
+        print("=========================================")
+
+        verification = client.verify.v2.services(
+            service_sid
+        ).verifications.create(
             to=phone,
+            channel="sms",
         )
 
-        print("TWILIO OTP SENT:", phone, message.sid)
+        print("TWILIO VERIFY STARTED:", phone, verification.sid, verification.status)
+
+        return TWILIO_VERIFY_PREFIX + verification.sid
 
     except TwilioRestException as e:
-        print("========== TWILIO ERROR ==========")
+        print("========== TWILIO VERIFY SEND ERROR ==========")
         print("status:", getattr(e, "status", None))
         print("code:", getattr(e, "code", None))
         print("message:", getattr(e, "msg", str(e)))
         print("details:", getattr(e, "details", None))
         print("uri:", getattr(e, "uri", None))
-        print("==================================")
+        print("==============================================")
 
         raise serializers.ValidationError({
-            "phone": f"Failed to send OTP SMS: {getattr(e, 'msg', str(e))}"
+            "phone": f"Failed to send OTP: {getattr(e, 'msg', str(e))}"
         })
+
+    except serializers.ValidationError:
+        raise
 
     except Exception as e:
-        print("========== OTP SMS ERROR ==========")
+        print("========== OTP VERIFY START ERROR ==========")
         print(e)
-        print("===================================")
+        print("============================================")
 
         raise serializers.ValidationError({
-            "phone": "Failed to send OTP SMS. Please try again."
+            "phone": "Failed to send OTP. Please try again."
         })
+
+
+def check_otp_verification(*, phone: str, code: str, otp_hash: str) -> bool:
+
+    phone = normalize_e164(phone)
+    code = str(code or "").strip()
+    otp_hash = otp_hash or ""
+
+    if otp_hash.startswith(TWILIO_VERIFY_PREFIX):
+        if not twilio_verify_enabled():
+            return False
+
+        try:
+            client, service_sid = get_twilio_verify_client()
+
+            check = client.verify.v2.services(
+                service_sid
+            ).verification_checks.create(
+                to=phone,
+                code=code,
+            )
+
+            print("TWILIO VERIFY CHECK:", phone, check.status)
+
+            return check.status == "approved"
+
+        except TwilioRestException as e:
+            print("========== TWILIO VERIFY CHECK ERROR ==========")
+            print("status:", getattr(e, "status", None))
+            print("code:", getattr(e, "code", None))
+            print("message:", getattr(e, "msg", str(e)))
+            print("details:", getattr(e, "details", None))
+            print("uri:", getattr(e, "uri", None))
+            print("================================================")
+            return False
+
+        except Exception as e:
+            print("========== OTP VERIFY CHECK ERROR ==========")
+            print(e)
+            print("============================================")
+            return False
+
+    if otp_hash.startswith(LOCAL_OTP_PREFIX):
+        real_hash = otp_hash[len(LOCAL_OTP_PREFIX):]
+        return check_password(code, real_hash)
+
+    # Backward compatibility for OTPs created by your old code.
+    return check_password(code, otp_hash)
 
 
 class SendOTPSerializer(serializers.Serializer):
@@ -129,15 +177,15 @@ class SendOTPSerializer(serializers.Serializer):
             defaults={"full_name": "Pending"},
         )
 
+        now = timezone.now()
+
         # Resend cooldown
-        if user.otp_expires_at and user.otp_hash and timezone.now() < user.otp_expires_at:
+        if user.otp_expires_at and user.otp_hash and now < user.otp_expires_at:
             last_sent_at = user.otp_expires_at - timezone.timedelta(
                 seconds=OTP_TTL_SECONDS,
             )
 
-            seconds_since_last = int(
-                (timezone.now() - last_sent_at).total_seconds()
-            )
+            seconds_since_last = int((now - last_sent_at).total_seconds())
 
             if seconds_since_last < RESEND_COOLDOWN_SECONDS:
                 wait_seconds = RESEND_COOLDOWN_SECONDS - seconds_since_last
@@ -146,15 +194,13 @@ class SendOTPSerializer(serializers.Serializer):
                     "phone": f"Please wait {wait_seconds}s before requesting a new OTP."
                 })
 
-        code = f"{random.randint(100000, 999999)}"
-        otp_hash = make_password(code)
-        expires_at = timezone.now() + timezone.timedelta(
-            seconds=OTP_TTL_SECONDS,
+        otp_hash = start_otp_verification(
+            phone=phone,
+            purpose="login",
         )
 
-        # Save OTP before sending SMS
         user.otp_hash = otp_hash
-        user.otp_expires_at = expires_at
+        user.otp_expires_at = now + timezone.timedelta(seconds=OTP_TTL_SECONDS)
         user.otp_attempts = 0
         user.save(
             update_fields=[
@@ -162,12 +208,6 @@ class SendOTPSerializer(serializers.Serializer):
                 "otp_expires_at",
                 "otp_attempts",
             ]
-        )
-
-        send_otp_sms(
-            phone=phone,
-            code=code,
-            purpose="login",
         )
 
         return {
@@ -182,8 +222,6 @@ class VerifyOTPSerializer(serializers.Serializer):
     code = serializers.CharField(min_length=4, max_length=8)
 
     def validate(self, attrs):
-        # IMPORTANT:
-        # SendOTP saves phone as E.164. Verify must also use E.164.
         attrs["phone"] = normalize_e164(attrs["phone"])
         attrs["code"] = attrs["code"].strip()
         return attrs
@@ -209,7 +247,7 @@ class VerifyOTPSerializer(serializers.Serializer):
                 "code": "OTP expired. Please request again."
             })
 
-        if user.otp_attempts >= 5:
+        if user.otp_attempts >= MAX_OTP_ATTEMPTS:
             raise serializers.ValidationError({
                 "code": "Too many attempts. Please request OTP again."
             })
@@ -217,7 +255,13 @@ class VerifyOTPSerializer(serializers.Serializer):
         user.otp_attempts += 1
         user.save(update_fields=["otp_attempts"])
 
-        if not check_password(code, user.otp_hash):
+        is_valid = check_otp_verification(
+            phone=phone,
+            code=code,
+            otp_hash=user.otp_hash,
+        )
+
+        if not is_valid:
             raise serializers.ValidationError({
                 "code": "Invalid OTP."
             })
@@ -323,20 +367,17 @@ class RequestPhoneChangeOTPSerializer(serializers.Serializer):
                     "new_phone": f"Please wait {wait_seconds}s before requesting OTP again."
                 })
 
-        code = f"{random.randint(100000, 999999)}"
+        otp_hash = start_otp_verification(
+            phone=new_phone,
+            purpose="phone_change",
+        )
 
         PhoneChangeOTP.objects.create(
             user=user,
             new_phone=new_phone,
-            otp_hash=make_password(code),
+            otp_hash=otp_hash,
             expires_at=now + timezone.timedelta(seconds=OTP_TTL_SECONDS),
             sent_at=now,
-        )
-
-        send_otp_sms(
-            phone=new_phone,
-            code=code,
-            purpose="phone_change",
         )
 
         return {
@@ -376,7 +417,7 @@ class ConfirmPhoneChangeSerializer(serializers.Serializer):
             user=user,
             new_phone=new_phone,
             is_used=False,
-        ).order_by("-created_at").first()
+        ).order_by("-sent_at").first()
 
         if not otp:
             raise serializers.ValidationError({
@@ -388,7 +429,7 @@ class ConfirmPhoneChangeSerializer(serializers.Serializer):
                 "code": "OTP expired. Please request again."
             })
 
-        if otp.attempts >= 5:
+        if otp.attempts >= MAX_OTP_ATTEMPTS:
             raise serializers.ValidationError({
                 "code": "Too many attempts. Please request OTP again."
             })
@@ -396,7 +437,13 @@ class ConfirmPhoneChangeSerializer(serializers.Serializer):
         otp.attempts += 1
         otp.save(update_fields=["attempts"])
 
-        if not check_password(code, otp.otp_hash):
+        is_valid = check_otp_verification(
+            phone=new_phone,
+            code=code,
+            otp_hash=otp.otp_hash,
+        )
+
+        if not is_valid:
             raise serializers.ValidationError({
                 "code": "Invalid OTP."
             })

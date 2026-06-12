@@ -1,4 +1,5 @@
 import json
+import uuid
 
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
@@ -54,7 +55,11 @@ class GlobalCallConsumer(AsyncWebsocketConsumer):
 
         await self.send_json({
             "event": "global_call_connected",
+            "type": "global_call_connected",
             "user_id": str(self.user.id),
+            "payload": {
+                "user_id": str(self.user.id),
+            },
         })
 
     async def disconnect(self, close_code):
@@ -74,14 +79,14 @@ class GlobalCallConsumer(AsyncWebsocketConsumer):
         print("event:", event)
         print("===============================================")
 
-        await self.send_json(event["data"])
+        await self.send_json(event.get("data", {}))
 
     async def call_cancelled(self, event):
         print("========== GLOBAL CALL CANCELLED EVENT ==========")
         print("event:", event)
         print("================================================")
 
-        await self.send_json(event["data"])
+        await self.send_json(event.get("data", {}))
 
     async def send_json(self, data):
         print("GLOBAL SEND JSON:", data)
@@ -135,8 +140,13 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
 
         await self.send_json({
             "event": "call_socket_connected",
+            "type": "call_socket_connected",
             "conversation_id": str(self.conversation_id),
             "user_id": str(self.user.id),
+            "payload": {
+                "conversation_id": str(self.conversation_id),
+                "user_id": str(self.user.id),
+            },
         })
 
     async def disconnect(self, close_code):
@@ -173,9 +183,15 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
             await self.send_json({"error": "Invalid JSON"})
             return
 
-   
         event = data.get("event") or data.get("type")
-        target_user = data.get("target_user") or data.get("targetUser")
+
+        target_user = (
+            data.get("target_user")
+            or data.get("targetUser")
+            or data.get("target_user_id")
+            or data.get("targetUserId")
+        )
+
         conversation_id = (
             data.get("conversation_id")
             or data.get("conversationId")
@@ -193,6 +209,8 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
                     "type",
                     "target_user",
                     "targetUser",
+                    "target_user_id",
+                    "targetUserId",
                     "conversation_id",
                     "conversationId",
                 }
@@ -233,14 +251,53 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
         if not isinstance(payload, dict):
             payload = {}
 
+        if target_user is None or str(target_user).strip() == "":
+            target_user = await self.get_other_member_user_id(
+                conversation_id,
+                self.user.id,
+            )
+
+        call_id = (
+            payload.get("call_id")
+            or payload.get("callId")
+            or data.get("call_id")
+            or data.get("callId")
+        )
+
+        if not call_id:
+            call_id = str(uuid.uuid4())
+
         payload.setdefault("from", str(self.user.id))
         payload.setdefault("from_user", str(self.user.id))
+        payload.setdefault("caller_id", str(self.user.id))
+        payload.setdefault("callerId", str(self.user.id))
+
         payload.setdefault("conversation_id", str(conversation_id))
         payload.setdefault("conversationId", str(conversation_id))
+
+        payload.setdefault("call_id", str(call_id))
+        payload.setdefault("callId", str(call_id))
 
         if target_user is not None:
             payload.setdefault("target_user", str(target_user))
             payload.setdefault("targetUser", str(target_user))
+
+        if event == CALL_OFFER:
+            await self.send_incoming_call_to_global_socket(
+                target_user=target_user,
+                conversation_id=conversation_id,
+                call_id=call_id,
+                payload=payload,
+            )
+
+        if event in {CALL_REJECT, CALL_END, CALL_TIMEOUT}:
+            await self.send_call_cancelled_to_global_socket(
+                target_user=target_user,
+                conversation_id=conversation_id,
+                call_id=call_id,
+                payload=payload,
+                reason=event,
+            )
 
         if event == CALL_READY:
             print("")
@@ -267,11 +324,140 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
 
         await self.send_json({
             "event": "call_event_sent",
+            "type": "call_event_sent",
             "sent_event": event,
             "from_user": str(self.user.id),
             "target_user": str(target_user) if target_user is not None else None,
             "conversation_id": str(conversation_id),
+            "payload": {
+                "sent_event": event,
+                "from_user": str(self.user.id),
+                "target_user": str(target_user) if target_user is not None else None,
+                "conversation_id": str(conversation_id),
+                "call_id": str(call_id),
+                "callId": str(call_id),
+            },
         })
+
+    async def send_incoming_call_to_global_socket(
+        self,
+        target_user,
+        conversation_id,
+        call_id,
+        payload,
+    ):
+        if target_user is None or str(target_user).strip() == "":
+            print("GLOBAL INCOMING NOT SENT: target_user empty")
+            return
+
+        is_video_call = (
+            payload.get("is_video_call") is True
+            or payload.get("isVideoCall") is True
+            or str(payload.get("is_video_call", "")).lower() == "true"
+            or str(payload.get("isVideoCall", "")).lower() == "true"
+        )
+
+        caller_name = await self.get_user_display_name(self.user.id)
+        caller_avatar = await self.get_user_avatar(self.user.id)
+
+        global_payload = {
+            "conversation_id": str(conversation_id),
+            "conversationId": str(conversation_id),
+
+            "caller_id": str(self.user.id),
+            "callerId": str(self.user.id),
+
+            "from": str(self.user.id),
+            "from_user": str(self.user.id),
+
+            "target_user": str(target_user),
+            "targetUser": str(target_user),
+
+            "caller_name": caller_name,
+            "callerName": caller_name,
+
+            "caller_avatar": caller_avatar,
+            "callerAvatar": caller_avatar,
+
+            "is_video_call": is_video_call,
+            "isVideoCall": is_video_call,
+
+            "call_id": str(call_id),
+            "callId": str(call_id),
+
+            "offer": payload.get("offer"),
+        }
+
+        print("")
+        print("################################################")
+        print("### SENDING GLOBAL incoming_call")
+        print("################################################")
+        print("to group:", f"user_call_{target_user}")
+        print("payload:", global_payload)
+        print("################################################")
+
+        await self.channel_layer.group_send(
+            f"user_call_{target_user}",
+            {
+                "type": "incoming_call",
+                "data": {
+                    "event": "incoming_call",
+                    "type": "incoming_call",
+                    "payload": global_payload,
+                },
+            },
+        )
+
+    async def send_call_cancelled_to_global_socket(
+        self,
+        target_user,
+        conversation_id,
+        call_id,
+        payload,
+        reason,
+    ):
+        if target_user is None or str(target_user).strip() == "":
+            print("GLOBAL CANCEL NOT SENT: target_user empty")
+            return
+
+        global_payload = {
+            "conversation_id": str(conversation_id),
+            "conversationId": str(conversation_id),
+
+            "from": str(self.user.id),
+            "from_user": str(self.user.id),
+
+            "caller_id": str(self.user.id),
+            "callerId": str(self.user.id),
+
+            "target_user": str(target_user),
+            "targetUser": str(target_user),
+
+            "call_id": str(call_id),
+            "callId": str(call_id),
+
+            "reason": reason,
+        }
+
+        print("")
+        print("################################################")
+        print("### SENDING GLOBAL call_cancelled")
+        print("################################################")
+        print("to group:", f"user_call_{target_user}")
+        print("payload:", global_payload)
+        print("################################################")
+
+        await self.channel_layer.group_send(
+            f"user_call_{target_user}",
+            {
+                "type": "call_cancelled",
+                "data": {
+                    "event": "call_cancelled",
+                    "type": "call_cancelled",
+                    "payload": global_payload,
+                },
+            },
+        )
 
     async def call_signal(self, event):
         from_user = event.get("from_user")
@@ -303,6 +489,7 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
 
         response = {
             "event": signal_event,
+            "type": signal_event,
             "from_user": from_user,
             "target_user": target_user,
             "conversation_id": event.get("conversation_id"),
@@ -323,3 +510,53 @@ class CallSignalingConsumer(AsyncWebsocketConsumer):
             conversation_id=conversation_id,
             user_id=user_id,
         ).exists()
+
+    @database_sync_to_async
+    def get_other_member_user_id(self, conversation_id, current_user_id):
+        member = (
+            ConversationMember.objects
+            .filter(conversation_id=conversation_id)
+            .exclude(user_id=current_user_id)
+            .first()
+        )
+
+        if member:
+            return str(member.user_id)
+
+        return None
+
+    @database_sync_to_async
+    def get_user_display_name(self, user_id):
+        try:
+            user = User.objects.get(id=user_id)
+
+            for field in ["full_name", "name", "username", "phone"]:
+                value = getattr(user, field, None)
+
+                if value:
+                    return str(value)
+
+            return "Incoming call"
+        except User.DoesNotExist:
+            return "Incoming call"
+
+    @database_sync_to_async
+    def get_user_avatar(self, user_id):
+        try:
+            user = User.objects.get(id=user_id)
+
+            image = (
+                getattr(user, "profile_picture", None)
+                or getattr(user, "avatar", None)
+                or getattr(user, "image", None)
+            )
+
+            if image:
+                try:
+                    return image.url
+                except Exception:
+                    return str(image)
+
+            return ""
+        except User.DoesNotExist:
+            return ""
