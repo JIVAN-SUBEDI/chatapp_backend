@@ -63,10 +63,9 @@ def start_otp_verification(*, phone: str, purpose: str = "login") -> str:
 
     phone = normalize_e164(phone)
 
-    if not twilio_verify_enabled():
-        code = f"{random.randint(100000, 999999)}"
-        print(f"DEV OTP [{purpose}]: {phone} -> {code}")
-        return LOCAL_OTP_PREFIX + make_password(code)
+    if settings.DEBUG and phone == settings.DEV_BYPASS_PHONE:
+        print(f"DEV OTP: {settings.DEV_FIXED_OTP}")
+        return LOCAL_OTP_PREFIX + make_password(settings.DEV_FIXED_OTP)
 
     try:
         client, service_sid = get_twilio_verify_client()
@@ -120,7 +119,8 @@ def check_otp_verification(*, phone: str, code: str, otp_hash: str) -> bool:
     phone = normalize_e164(phone)
     code = str(code or "").strip()
     otp_hash = otp_hash or ""
-
+    if settings.DEBUG and phone == settings.DEV_BYPASS_PHONE:
+        return code == settings.DEV_FIXED_OTP
     if otp_hash.startswith(TWILIO_VERIFY_PREFIX):
         if not twilio_verify_enabled():
             return False

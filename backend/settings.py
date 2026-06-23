@@ -6,6 +6,7 @@ from pathlib import Path
 from corsheaders.defaults import default_headers
 from dotenv import load_dotenv
 import os
+from datetime import timedelta
 
 # =========================
 # BASE DIR + ENV
@@ -126,10 +127,29 @@ REST_FRAMEWORK = {
     ),
 }
 
+SIMPLE_JWT = {
+    # Access token valid for 1 day
+    "ACCESS_TOKEN_LIFETIME": timedelta(days=1),
+
+    # Refresh token valid for 1 month (30 days)
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=30),
+
+    # Optional but recommended
+    "ROTATE_REFRESH_TOKENS": False,
+    "BLACKLIST_AFTER_ROTATION": False,
+
+    "UPDATE_LAST_LOGIN": True,
+
+    "ALGORITHM": "HS256",
+    "SIGNING_KEY": SECRET_KEY,
+
+    "AUTH_HEADER_TYPES": ("Bearer",),
+}
 # =========================
 # CORS
 # =========================
-
+DEV_BYPASS_PHONE = "+9779800000000"
+DEV_FIXED_OTP = "123456"
 CORS_ALLOW_ALL_ORIGINS = True
 
 CORS_ALLOW_HEADERS = list(default_headers) + [
