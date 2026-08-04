@@ -174,7 +174,9 @@ CORS_ALLOW_HEADERS = list(default_headers) + [
 # =========================
 # PASSWORD VALIDATION
 # =========================
-
+LIVEKIT_URL='wss://hiddenly-4enguym9.livekit.cloud'
+LIVEKIT_API_KEY='APIMtWwFYnwd6Us'
+LIVEKIT_API_SECRET='EMufMYCINVL5FFs8qdfp6O1ZFU8eYmgBXVAAnO4jj3DA'
 AUTH_PASSWORD_VALIDATORS = [
     {
         "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",

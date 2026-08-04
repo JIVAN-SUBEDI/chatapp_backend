@@ -1,18 +1,32 @@
+import json
 import mimetypes
+from datetime import timedelta
 
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
 from django.db.models import Count
+from django.shortcuts import render
+from django.utils import timezone
+from livekit import api
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Conversation, ConversationMember, Message,UserFCMToken,CallSession
+from .firebase import send_incoming_call_push, send_message_push
+from .models import (
+    CallParticipant,
+    CallSession,
+    Conversation,
+    ConversationMember,
+    Message,
+    MessageAttachment,
+    UserFCMToken,
+)
 from .serializers import ConversationSerializer, MessageSerializer
-from django.shortcuts import render
-from channels.layers import get_channel_layer
-from asgiref.sync import async_to_sync
-from .firebase import send_incoming_call_push,send_message_push
-from django.utils import timezone
 
 User = get_user_model()
 
@@ -21,18 +35,52 @@ def detect_message_type(file):
     if not file:
         return Message.TEXT
 
-    mime_type, _ = mimetypes.guess_type(file.name)
+    # UploadedFile.content_type is normally more reliable than the filename.
+    mime_type = getattr(file, "content_type", None)
+
+    if not mime_type:
+        mime_type, _ = mimetypes.guess_type(file.name)
 
     if not mime_type:
         return Message.FILE
 
-    if mime_type.startswith("image"):
+    if mime_type.startswith("image/"):
         return Message.IMAGE
-    if mime_type.startswith("video"):
+    if mime_type.startswith("video/"):
         return Message.VIDEO
-    if mime_type.startswith("audio"):
+    if mime_type.startswith("audio/"):
         return Message.AUDIO
 
+    return Message.FILE
+
+
+def _get_uploaded_media(request):
+    """Return every uploaded media file while supporting common field names."""
+    files = request.FILES.getlist("media")
+
+    # Some frontends submit arrays using media[].
+    if not files:
+        files = request.FILES.getlist("media[]")
+
+    return files
+
+
+def _group_message_type(files, requested_type=None):
+    valid_types = {value for value, _ in Message.MESSAGE_TYPES}
+
+    if requested_type in valid_types:
+        return requested_type
+
+    if not files:
+        return Message.TEXT
+
+    detected_types = [detect_message_type(file) for file in files]
+
+    # If every attachment is the same kind, expose that kind on Message.
+    if len(set(detected_types)) == 1:
+        return detected_types[0]
+
+    # Mixed image/video/file batches are represented as a general file message.
     return Message.FILE
 
 
@@ -268,68 +316,154 @@ class ConversationMessagesView(generics.ListAPIView):
 
         is_member = ConversationMember.objects.filter(
             conversation_id=conversation_id,
-            user=self.request.user
+            user=self.request.user,
         ).exists()
 
         if not is_member:
             return Message.objects.none()
 
-        return Message.objects.filter(
-            conversation_id=conversation_id
+        return (
+            Message.objects
+            .filter(conversation_id=conversation_id)
+            .select_related("sender", "reply_to__sender", "reaction_to__sender")
+            .prefetch_related("attachments", "read_by")
         )
-
-
 
 
 class SendMessageView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, conversation_id):
-        member = ConversationMember.objects.filter(
-            conversation_id=conversation_id,
-            user=request.user
-        ).first()
+        member = (
+            ConversationMember.objects
+            .select_related("conversation")
+            .filter(
+                conversation_id=conversation_id,
+                user=request.user,
+            )
+            .first()
+        )
 
         if not member:
-            return Response({"error": "You are not a member"}, status=403)
+            return Response(
+                {"error": "You are not a member"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         if member.is_blocked:
             return Response(
                 {"error": "You are blocked in this chat"},
-                status=403
+                status=status.HTTP_403_FORBIDDEN,
             )
 
         conversation = member.conversation
+        uploaded_files = _get_uploaded_media(request)
+        uploaded_thumbnails = request.FILES.getlist("thumbnail")
 
-        media = request.FILES.get("media")
-        message_type = request.data.get("message_type")
+        if not uploaded_thumbnails:
+            uploaded_thumbnails = request.FILES.getlist("thumbnail[]")
 
-        if not message_type:
-            message_type = detect_message_type(media)
+        text = str(request.data.get("text", "")).strip()
+        requested_type = request.data.get("message_type")
 
-        message = Message.objects.create(
-            conversation=conversation,
-            sender=request.user,
-            message_type=message_type,
-            text=request.data.get("text", ""),
-            media=media,
-            thumbnail=request.FILES.get("thumbnail"),
-            file_name=media.name if media else None,
-            file_size=media.size if media else None,
-            mime_type=media.content_type if media else None,
-            duration=request.data.get("duration") or None,
-            reply_to_id=request.data.get("reply_to") or None,
-            reaction_to_id=request.data.get("reaction_to") or None,
-            reaction=request.data.get("reaction") or None,
+        if not text and not uploaded_files:
+            return Response(
+                {"error": "Text or at least one media file is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        message_type = _group_message_type(
+            uploaded_files,
+            requested_type=requested_type,
         )
 
-        message.read_by.add(request.user)
+        # Keep the original Message.media behavior for exactly one file.
+        # Multiple files are stored as ordered MessageAttachment rows.
+        single_file = uploaded_files[0] if len(uploaded_files) == 1 else None
+        single_thumbnail = (
+            uploaded_thumbnails[0]
+            if single_file and uploaded_thumbnails
+            else None
+        )
 
-        conversation.save()
+        try:
+            with transaction.atomic():
+                message = Message.objects.create(
+                    conversation=conversation,
+                    sender=request.user,
+                    message_type=message_type,
+                    text=text,
+                    media=single_file,
+                    thumbnail=single_thumbnail,
+                    file_name=single_file.name if single_file else None,
+                    file_size=single_file.size if single_file else None,
+                    mime_type=(
+                        getattr(single_file, "content_type", None)
+                        if single_file
+                        else None
+                    ),
+                    duration=(
+                        request.data.get("duration") or None
+                        if single_file
+                        else None
+                    ),
+                    reply_to_id=request.data.get("reply_to") or None,
+                    reaction_to_id=request.data.get("reaction_to") or None,
+                    reaction=request.data.get("reaction") or None,
+                )
+
+                if len(uploaded_files) > 1:
+                    for index, uploaded_file in enumerate(uploaded_files):
+                        thumbnail = (
+                            uploaded_thumbnails[index]
+                            if index < len(uploaded_thumbnails)
+                            else None
+                        )
+
+                        # Use create() instead of bulk_create() so FileField
+                        # storage handling runs normally for every upload.
+                        MessageAttachment.objects.create(
+                            message=message,
+                            file=uploaded_file,
+                            thumbnail=thumbnail,
+                            attachment_type=detect_message_type(
+                                uploaded_file
+                            ),
+                            file_name=uploaded_file.name,
+                            file_size=uploaded_file.size,
+                            mime_type=getattr(
+                                uploaded_file,
+                                "content_type",
+                                None,
+                            ),
+                            order=index,
+                        )
+
+                message.read_by.add(request.user)
+
+                # Trigger Conversation.updated_at without modifying other fields.
+                conversation.save(update_fields=["updated_at"])
+
+        except (IntegrityError, ValueError) as exc:
+            return Response(
+                {
+                    "error": "Unable to send message",
+                    "details": str(exc),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Reload relations so the response and WebSocket include attachments.
+        message = (
+            Message.objects
+            .select_related("sender", "reply_to__sender", "reaction_to__sender")
+            .prefetch_related("attachments", "read_by")
+            .get(pk=message.pk)
+        )
 
         data = MessageSerializer(
             message,
-            context={"request": request}
+            context={"request": request},
         ).data
 
         channel_layer = get_channel_layer()
@@ -339,12 +473,8 @@ class SendMessageView(APIView):
             {
                 "type": "chat_message",
                 "message": data,
-            }
+            },
         )
-
-        # -------------------------------
-        # FCM PUSH NOTIFICATION FOR MESSAGE
-        # -------------------------------
 
         sender_name = (
             getattr(request.user, "full_name", None)
@@ -354,15 +484,30 @@ class SendMessageView(APIView):
         )
 
         sender_avatar = ""
-
         profile_picture = getattr(request.user, "profile_picture", None)
+
         if profile_picture:
             try:
-                sender_avatar = request.build_absolute_uri(profile_picture.url)
-            except Exception:
+                sender_avatar = request.build_absolute_uri(
+                    profile_picture.url
+                )
+            except (AttributeError, ValueError):
                 sender_avatar = ""
 
-        if message.message_type == Message.TEXT:
+        media_count = len(uploaded_files)
+
+        if media_count > 1:
+            detected_types = [
+                detect_message_type(file) for file in uploaded_files
+            ]
+
+            if all(kind == Message.IMAGE for kind in detected_types):
+                body = f"Sent {media_count} images"
+            elif all(kind == Message.VIDEO for kind in detected_types):
+                body = f"Sent {media_count} videos"
+            else:
+                body = f"Sent {media_count} attachments"
+        elif message.message_type == Message.TEXT:
             body = message.text or "New message"
         elif message.message_type == Message.IMAGE:
             body = "Sent an image"
@@ -373,7 +518,6 @@ class SendMessageView(APIView):
         else:
             body = "Sent a file"
 
-        # For group chat, title can be group name
         if conversation.type == Conversation.GROUP:
             title = conversation.name or sender_name
             body = f"{sender_name}: {body}"
@@ -390,24 +534,26 @@ class SendMessageView(APIView):
             "sender_avatar": sender_avatar,
             "message_type": message.message_type,
             "text": message.text or "",
+            "attachment_count": media_count,
+            "has_multiple_attachments": media_count > 1,
         }
 
-        receiver_members = ConversationMember.objects.filter(
-            conversation=conversation,
-            is_blocked=False
-        ).exclude(
-            user=request.user
+        receiver_ids = (
+            ConversationMember.objects
+            .filter(
+                conversation=conversation,
+                is_blocked=False,
+            )
+            .exclude(user=request.user)
+            .values_list("user_id", flat=True)
         )
-
-        receiver_ids = receiver_members.values_list("user_id", flat=True)
-        print(receiver_ids)
 
         tokens = UserFCMToken.objects.filter(
             user_id__in=receiver_ids,
+            is_active=True,
         )
-        print(tokens)
-        for item in tokens:
-            print(item.token)
+
+        for item in tokens.iterator():
             try:
                 send_message_push(
                     token=item.token,
@@ -417,7 +563,10 @@ class SendMessageView(APIView):
                 item.is_active = False
                 item.save(update_fields=["is_active"])
 
-        return Response(data, status=status.HTTP_201_CREATED)
+        return Response(
+            data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class EditMessageView(APIView):
@@ -425,18 +574,32 @@ class EditMessageView(APIView):
 
     def patch(self, request, message_id):
         try:
-            message = Message.objects.get(id=message_id, sender=request.user)
+            message = Message.objects.get(
+                id=message_id,
+                sender=request.user,
+            )
         except Message.DoesNotExist:
-            return Response({"error": "Message not found"}, status=404)
+            return Response(
+                {"error": "Message not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         if message.is_deleted:
-            return Response({"error": "Message is deleted"}, status=400)
+            return Response(
+                {"error": "Message is deleted"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         message.text = request.data.get("text", message.text)
         message.is_edited = True
-        message.save()
+        message.save(update_fields=["text", "is_edited", "updated_at"])
 
-        return Response(MessageSerializer(message).data)
+        return Response(
+            MessageSerializer(
+                message,
+                context={"request": request},
+            ).data
+        )
 
 
 class DeleteMessageView(APIView):
@@ -444,15 +607,59 @@ class DeleteMessageView(APIView):
 
     def delete(self, request, message_id):
         try:
-            message = Message.objects.get(id=message_id, sender=request.user)
+            message = Message.objects.prefetch_related(
+                "attachments"
+            ).get(
+                id=message_id,
+                sender=request.user,
+            )
         except Message.DoesNotExist:
-            return Response({"error": "Message not found"}, status=404)
+            return Response(
+                {"error": "Message not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if message.is_deleted:
+            return Response({"success": True})
+
+        # Remove old single-file media from storage.
+        if message.media:
+            message.media.delete(save=False)
+
+        if message.thumbnail:
+            message.thumbnail.delete(save=False)
+
+        # Remove all files belonging to grouped attachments.
+        for attachment in message.attachments.all():
+            if attachment.file:
+                attachment.file.delete(save=False)
+
+            if attachment.thumbnail:
+                attachment.thumbnail.delete(save=False)
+
+        message.attachments.all().delete()
 
         message.text = ""
         message.media = None
         message.thumbnail = None
+        message.file_name = None
+        message.file_size = None
+        message.mime_type = None
+        message.duration = None
         message.is_deleted = True
-        message.save()
+        message.save(
+            update_fields=[
+                "text",
+                "media",
+                "thumbnail",
+                "file_name",
+                "file_size",
+                "mime_type",
+                "duration",
+                "is_deleted",
+                "updated_at",
+            ]
+        )
 
         return Response({"success": True})
 
@@ -766,64 +973,295 @@ class SaveFCMTokenView(APIView):
         return Response({"success": True})
 
 
+def _as_boolean(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _user_display_name(user):
+    return (
+        getattr(user, "full_name", None)
+        or getattr(user, "name", None)
+        or getattr(user, "username", None)
+        or getattr(user, "phone", None)
+        or str(user.id)
+    )
+
+
+def _user_avatar_url(request, user):
+    image = (
+        getattr(user, "profile_picture", None)
+        or getattr(user, "avatar", None)
+    )
+
+    if not image:
+        return ""
+
+    try:
+        return request.build_absolute_uri(image.url)
+    except (AttributeError, ValueError):
+        return str(image) if image else ""
+
+
+def _get_call_session(call_id, lock=False):
+    queryset = CallSession.objects.select_related(
+        "conversation",
+        "caller",
+        "receiver",
+    )
+
+    if lock:
+        queryset = queryset.select_for_update()
+
+    value = str(call_id).strip()
+
+    if value.isdigit():
+        return queryset.filter(pk=int(value)).first()
+
+    try:
+        return queryset.filter(call_uuid=value).first()
+    except (ValidationError, ValueError):
+        return None
+
+
+def _broadcast_call_event(conversation_id, data):
+    channel_layer = get_channel_layer()
+
+    async_to_sync(channel_layer.group_send)(
+        f"chat_{conversation_id}",
+        {
+            "type": "call_event",
+            "data": data,
+        },
+    )
+
+
+def _serialize_call(call):
+    return {
+        "call_id": call.id,
+        "call_uuid": str(call.call_uuid),
+        "conversation_id": call.conversation_id,
+        "conversation_type": call.conversation.type,
+        "is_group_call": call.conversation.type == Conversation.GROUP,
+        "caller_id": call.caller_id,
+        "receiver_id": call.receiver_id,
+        "call_type": call.call_type,
+        "is_video_call": call.call_type == CallSession.VIDEO,
+        "status": call.status,
+        "created_at": call.created_at.isoformat(),
+        "answered_at": (
+            call.answered_at.isoformat()
+            if call.answered_at
+            else None
+        ),
+        "ended_at": (
+            call.ended_at.isoformat()
+            if call.ended_at
+            else None
+        ),
+    }
+
+
 class StartCallView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        receiver_id = request.data.get("receiver_id")
         conversation_id = request.data.get("conversation_id")
-        is_video_call = request.data.get("is_video_call", False)
+        receiver_id = request.data.get("receiver_id")
+        is_video_call = _as_boolean(
+            request.data.get("is_video_call", False)
+        )
 
-        if not receiver_id or not conversation_id:
+        if not conversation_id:
             return Response(
-                {"error": "receiver_id and conversation_id are required"},
+                {"error": "conversation_id is required"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        try:
-            receiver = User.objects.get(id=receiver_id)
-        except User.DoesNotExist:
+        conversation = Conversation.objects.filter(
+            id=conversation_id
+        ).first()
+
+        if not conversation:
             return Response(
-                {"error": "Receiver not found"},
+                {"error": "Conversation not found"},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        call = CallSession.objects.create(
-            conversation_id=conversation_id,
-            caller=request.user,
-            receiver=receiver,
-            call_type=CallSession.VIDEO if is_video_call else CallSession.AUDIO,
+        caller_membership = ConversationMember.objects.filter(
+            conversation=conversation,
+            user=request.user,
+            is_blocked=False,
+        ).first()
+
+        if not caller_membership:
+            return Response(
+                {
+                    "error": (
+                        "You are not an active member of this conversation"
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        active_members = list(
+            ConversationMember.objects.filter(
+                conversation=conversation,
+                is_blocked=False,
+            )
+            .select_related("user")
+            .order_by("id")
         )
 
-        caller_name = (
-            getattr(request.user, "full_name", None)
-            or getattr(request.user, "username", "")
-            or str(request.user.id)
-        )
+        if len(active_members) < 2:
+            return Response(
+                {"error": "At least two active members are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        caller_avatar = (
-            getattr(request.user, "avatar_url", None)
-            or getattr(request.user, "avatar", "")
-            or ""
-        )
+        receiver = None
+
+        if conversation.type == Conversation.PRIVATE:
+            other_members = [
+                member
+                for member in active_members
+                if member.user_id != request.user.id
+            ]
+
+            if len(other_members) != 1:
+                return Response(
+                    {
+                        "error": (
+                            "Private conversation must contain exactly "
+                            "two active members"
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            receiver = other_members[0].user
+
+            if receiver_id is not None:
+                try:
+                    supplied_receiver_id = int(receiver_id)
+                except (TypeError, ValueError):
+                    return Response(
+                        {"error": "Invalid receiver_id"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                if supplied_receiver_id != receiver.id:
+                    return Response(
+                        {
+                            "error": (
+                                "receiver_id is not the other member "
+                                "of this private conversation"
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+        elif conversation.type != Conversation.GROUP:
+            return Response(
+                {"error": "Unsupported conversation type"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        existing_call = CallSession.objects.filter(
+            conversation=conversation,
+            status__in=[
+                CallSession.RINGING,
+                CallSession.ACCEPTED,
+            ],
+        ).first()
+
+        if existing_call:
+            return Response(
+                {
+                    "error": "A call is already active in this conversation",
+                    "call_id": existing_call.id,
+                    "call_uuid": str(existing_call.call_uuid),
+                    "status": existing_call.status,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        now = timezone.now()
+
+        try:
+            with transaction.atomic():
+                call = CallSession.objects.create(
+                    conversation=conversation,
+                    caller=request.user,
+                    receiver=receiver,
+                    call_type=(
+                        CallSession.VIDEO
+                        if is_video_call
+                        else CallSession.AUDIO
+                    ),
+                )
+
+                participants = []
+
+                for member in active_members:
+                    is_caller = member.user_id == request.user.id
+
+                    participants.append(
+                        CallParticipant(
+                            call=call,
+                            user=member.user,
+                            status=(
+                                CallParticipant.JOINED
+                                if is_caller
+                                else CallParticipant.RINGING
+                            ),
+                            joined_at=now if is_caller else None,
+                            is_camera_enabled=(
+                                is_video_call and is_caller
+                            ),
+                        )
+                    )
+
+                CallParticipant.objects.bulk_create(participants)
+
+        except (IntegrityError, ValidationError) as exc:
+            return Response(
+                {
+                    "error": (
+                        "Unable to start call. Another active call may "
+                        "already exist in this conversation."
+                    ),
+                    "details": str(exc),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        caller_name = _user_display_name(request.user)
+        caller_avatar = _user_avatar_url(request, request.user)
 
         call_data = {
-            "call_id": call.id,
-            "conversation_id": conversation_id,
-            "caller_id": request.user.id,
+            "type": "incoming_call",
+            **_serialize_call(call),
             "caller_name": caller_name,
-            "caller_avatar": str(caller_avatar),
-            "is_video_call": bool(is_video_call),
+            "caller_avatar": caller_avatar,
+            "conversation_name": conversation.name or "",
         }
 
+        invited_user_ids = [
+            member.user_id
+            for member in active_members
+            if member.user_id != request.user.id
+        ]
+
         tokens = UserFCMToken.objects.filter(
-            user=receiver,
-            # is_active=True,
+            user_id__in=invited_user_ids,
+            is_active=True,
         )
 
         sent = 0
 
-        for item in tokens:
+        for item in tokens.iterator():
             try:
                 send_incoming_call_push(
                     token=item.token,
@@ -834,12 +1272,200 @@ class StartCallView(APIView):
                 item.is_active = False
                 item.save(update_fields=["is_active"])
 
+        _broadcast_call_event(conversation.id, call_data)
+
         return Response(
             {
                 "success": True,
-                "call_id": call.id,
+                **_serialize_call(call),
+                "livekit_room_name": call.livekit_room_name,
+                "invited_user_ids": invited_user_ids,
                 "push_sent": sent,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class LiveKitTokenView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        call_id = request.data.get("call_id")
+
+        if not call_id:
+            return Response(
+                {"error": "call_id is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        call = _get_call_session(call_id)
+
+        if not call:
+            return Response(
+                {"error": "Call not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if call.status in {
+            CallSession.ENDED,
+            CallSession.REJECTED,
+            CallSession.MISSED,
+            CallSession.CANCELLED,
+        }:
+            return Response(
+                {"error": "This call is no longer active"},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        membership = ConversationMember.objects.filter(
+            conversation=call.conversation,
+            user=request.user,
+            is_blocked=False,
+        ).first()
+
+        if not membership:
+            return Response(
+                {"error": "You are not allowed to join this call"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        participant = CallParticipant.objects.filter(
+            call=call,
+            user=request.user,
+        ).first()
+
+        if not participant:
+            return Response(
+                {"error": "You were not invited to this call"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if participant.status in {
+            CallParticipant.DECLINED,
+            CallParticipant.MISSED,
+        }:
+            return Response(
+                {"error": "You already declined or missed this call"},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        livekit_url = getattr(settings, "LIVEKIT_URL", "")
+        livekit_api_key = getattr(settings, "LIVEKIT_API_KEY", "")
+        livekit_api_secret = getattr(
+            settings,
+            "LIVEKIT_API_SECRET",
+            "",
+        )
+
+        if not all(
+            [
+                livekit_url,
+                livekit_api_key,
+                livekit_api_secret,
+            ]
+        ):
+            return Response(
+                {"error": "LiveKit settings are incomplete"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        if not call.livekit_room_name:
+            call.livekit_room_name = f"hiddenly-call-{call.call_uuid.hex}"
+            call.save(update_fields=["livekit_room_name"])
+
+        participant_name = _user_display_name(request.user)
+        participant_avatar = _user_avatar_url(request, request.user)
+        participant_identity = f"user-{request.user.id}"
+
+        participant_metadata = json.dumps(
+            {
+                "user_id": request.user.id,
+                "full_name": participant_name,
+                "profile_picture": participant_avatar,
+                "conversation_id": call.conversation_id,
+                "call_id": call.id,
+                "call_uuid": str(call.call_uuid),
             }
+        )
+
+        try:
+            participant_token = (
+                api.AccessToken(
+                    livekit_api_key,
+                    livekit_api_secret,
+                )
+                .with_identity(participant_identity)
+                .with_name(participant_name)
+                .with_metadata(participant_metadata)
+                .with_ttl(timedelta(hours=2))
+                .with_grants(
+                    api.VideoGrants(
+                        room_join=True,
+                        room=call.livekit_room_name,
+                        can_publish=True,
+                        can_subscribe=True,
+                        can_publish_data=True,
+                    )
+                )
+                .to_jwt()
+            )
+        except (TypeError, ValueError) as exc:
+            return Response(
+                {
+                    "error": "Unable to generate LiveKit token",
+                    "details": str(exc),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        joined_at = timezone.now()
+
+        update_fields = ["status"]
+        participant.status = CallParticipant.JOINED
+
+        if participant.joined_at is None:
+            participant.joined_at = joined_at
+            update_fields.append("joined_at")
+
+        participant.left_at = None
+        update_fields.append("left_at")
+        participant.save(update_fields=update_fields)
+
+        # The caller joining should not count as the call being answered.
+        if (
+            request.user.id != call.caller_id
+            and call.status == CallSession.RINGING
+        ):
+            call.status = CallSession.ACCEPTED
+            call.answered_at = joined_at
+            call.save(update_fields=["status", "answered_at"])
+
+        event_data = {
+            "type": "call_participant_joined",
+            **_serialize_call(call),
+            "participant": {
+                "user_id": request.user.id,
+                "name": participant_name,
+                "profile_picture": participant_avatar,
+                "status": participant.status,
+                "joined_at": participant.joined_at.isoformat(),
+            },
+        }
+
+        _broadcast_call_event(call.conversation_id, event_data)
+
+        return Response(
+            {
+                "server_url": livekit_url,
+                "participant_token": participant_token,
+                "room_name": call.livekit_room_name,
+                "call_id": call.id,
+                "call_uuid": str(call.call_uuid),
+                "call_type": call.call_type,
+                "is_video_call": call.call_type == CallSession.VIDEO,
+                "participant_identity": participant_identity,
+            },
+            status=status.HTTP_201_CREATED,
         )
 
 
@@ -847,44 +1473,207 @@ class UpdateCallStatusView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, call_id):
-        action = request.data.get("action")
+        action = str(request.data.get("action", "")).strip().lower()
 
-        try:
-            call = CallSession.objects.get(id=call_id)
-        except CallSession.DoesNotExist:
-            return Response(
-                {"error": "Call not found"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+        valid_actions = {
+            "accept",
+            "reject",
+            "ended",
+            "leave",
+            "missed",
+            "cancel",
+        }
 
-        if request.user not in [call.caller, call.receiver]:
-            return Response(
-                {"error": "Not allowed"},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-        print(action)
-        if action == "accept":
-            call.status = CallSession.ACCEPTED
-            call.answered_at = timezone.now()
-
-        elif action == "reject":
-            call.status = CallSession.REJECTED
-            call.ended_at = timezone.now()
-
-        elif action == "ended":
-            call.status = CallSession.ENDED
-            call.ended_at = timezone.now()
-
-        elif action == "missed":
-            call.status = CallSession.MISSED
-            call.ended_at = timezone.now()
-
-        else:
+        if action not in valid_actions:
             return Response(
                 {"error": "Invalid action"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        call.save()
+        with transaction.atomic():
+            call = _get_call_session(call_id, lock=True)
 
-        return Response({"success": True, "status": call.status})
+            if not call:
+                return Response(
+                    {"error": "Call not found"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            participant = CallParticipant.objects.select_for_update().filter(
+                call=call,
+                user=request.user,
+            ).first()
+
+            if not participant:
+                return Response(
+                    {"error": "Not allowed"},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            now = timezone.now()
+            is_group_call = call.conversation.type == Conversation.GROUP
+            is_caller = request.user.id == call.caller_id
+
+            if action == "accept":
+                if call.status in {
+                    CallSession.ENDED,
+                    CallSession.REJECTED,
+                    CallSession.MISSED,
+                    CallSession.CANCELLED,
+                }:
+                    return Response(
+                        {"error": "This call is no longer active"},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                participant.status = CallParticipant.JOINED
+                participant.joined_at = participant.joined_at or now
+                participant.left_at = None
+                participant.save(
+                    update_fields=[
+                        "status",
+                        "joined_at",
+                        "left_at",
+                    ]
+                )
+
+                if not is_caller and call.status == CallSession.RINGING:
+                    call.status = CallSession.ACCEPTED
+                    call.answered_at = now
+                    call.save(update_fields=["status", "answered_at"])
+
+            elif action == "reject":
+                if is_caller:
+                    return Response(
+                        {
+                            "error": (
+                                "The caller must cancel or end the call"
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                participant.status = CallParticipant.DECLINED
+                participant.left_at = now
+                participant.save(update_fields=["status", "left_at"])
+
+                if not is_group_call:
+                    call.status = CallSession.REJECTED
+                    call.ended_at = now
+                    call.save(update_fields=["status", "ended_at"])
+                else:
+                    remaining = CallParticipant.objects.filter(
+                        call=call,
+                    ).exclude(
+                        user_id=call.caller_id,
+                    ).filter(
+                        status__in=[
+                            CallParticipant.RINGING,
+                            CallParticipant.JOINED,
+                        ]
+                    ).exists()
+
+                    if not remaining and call.status == CallSession.RINGING:
+                        call.status = CallSession.REJECTED
+                        call.ended_at = now
+                        call.save(update_fields=["status", "ended_at"])
+
+            elif action == "missed":
+                if is_caller:
+                    return Response(
+                        {"error": "The caller cannot mark the call missed"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                participant.status = CallParticipant.MISSED
+                participant.left_at = now
+                participant.save(update_fields=["status", "left_at"])
+
+                if not is_group_call:
+                    call.status = CallSession.MISSED
+                    call.ended_at = now
+                    call.save(update_fields=["status", "ended_at"])
+                else:
+                    remaining = CallParticipant.objects.filter(
+                        call=call,
+                    ).exclude(
+                        user_id=call.caller_id,
+                    ).filter(
+                        status__in=[
+                            CallParticipant.RINGING,
+                            CallParticipant.JOINED,
+                        ]
+                    ).exists()
+
+                    if not remaining and call.status == CallSession.RINGING:
+                        call.status = CallSession.MISSED
+                        call.ended_at = now
+                        call.save(update_fields=["status", "ended_at"])
+
+            elif action == "cancel":
+                if not is_caller:
+                    return Response(
+                        {"error": "Only the caller can cancel the call"},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+
+                if call.status != CallSession.RINGING:
+                    return Response(
+                        {"error": "Only a ringing call can be cancelled"},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                call.status = CallSession.CANCELLED
+                call.ended_at = now
+                call.save(update_fields=["status", "ended_at"])
+
+                CallParticipant.objects.filter(
+                    call=call,
+                ).exclude(
+                    status__in=[
+                        CallParticipant.DECLINED,
+                        CallParticipant.MISSED,
+                    ]
+                ).update(
+                    status=CallParticipant.LEFT,
+                    left_at=now,
+                )
+                participant.status = CallParticipant.LEFT
+                participant.left_at = now
+
+            elif action in {"ended", "leave"}:
+                if is_group_call and not is_caller:
+                    participant.status = CallParticipant.LEFT
+                    participant.left_at = now
+                    participant.save(update_fields=["status", "left_at"])
+                else:
+                    call.status = CallSession.ENDED
+                    call.ended_at = now
+                    call.save(update_fields=["status", "ended_at"])
+
+                    CallParticipant.objects.filter(
+                        call=call,
+                    ).update(
+                        status=CallParticipant.LEFT,
+                        left_at=now,
+                    )
+                    participant.status = CallParticipant.LEFT
+                    participant.left_at = now
+
+        event_data = {
+            "type": "call_status_updated",
+            **_serialize_call(call),
+            "action": action,
+            "updated_by": request.user.id,
+            "participant_status": participant.status,
+        }
+
+        _broadcast_call_event(call.conversation_id, event_data)
+
+        return Response(
+            {
+                "success": True,
+                **_serialize_call(call),
+                "participant_status": participant.status,
+            }
+        )
