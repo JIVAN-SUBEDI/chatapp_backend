@@ -1061,7 +1061,83 @@ def _serialize_call(call):
             else None
         ),
     }
+# ============================================================
+# CALL TIMEOUT
+# ============================================================
 
+CALL_RING_TIMEOUT = timedelta(seconds=45)
+
+
+def _expire_stale_ringing_calls(conversation=None):
+
+
+    cutoff = timezone.now() - CALL_RING_TIMEOUT
+    now = timezone.now()
+
+    expired_calls = []
+
+    with transaction.atomic():
+
+        queryset = (
+            CallSession.objects
+            .select_for_update()
+            .select_related("conversation")
+            .filter(
+                status=CallSession.RINGING,
+                created_at__lt=cutoff,
+            )
+        )
+
+        if conversation is not None:
+            queryset = queryset.filter(conversation=conversation)
+
+        calls = list(queryset)
+
+        for call in calls:
+
+            # The whole call is now missed.
+            call.status = CallSession.MISSED
+            call.ended_at = now
+
+            call.save(
+                update_fields=[
+                    "status",
+                    "ended_at",
+                ]
+            )
+
+            # People who were still ringing missed the call.
+            CallParticipant.objects.filter(
+                call=call,
+                status=CallParticipant.RINGING,
+            ).update(
+                status=CallParticipant.MISSED,
+                left_at=now,
+            )
+
+            # Caller / already joined participant is no longer active.
+            CallParticipant.objects.filter(
+                call=call,
+                status=CallParticipant.JOINED,
+            ).update(
+                status=CallParticipant.LEFT,
+                left_at=now,
+            )
+
+            expired_calls.append(call)
+
+    # Broadcast after DB transaction
+    for call in expired_calls:
+        _broadcast_call_event(
+            call.conversation_id,
+            {
+                "type": "call_status_updated",
+                **_serialize_call(call),
+                "action": "timeout",
+            },
+        )
+
+    return len(expired_calls)
 
 class StartCallView(APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -1167,6 +1243,14 @@ class StartCallView(APIView):
                 {"error": "Unsupported conversation type"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # ------------------------------------------------------------
+        # CLEAN DEAD / STALE RINGING CALLS
+        # ------------------------------------------------------------
+
+        _expire_stale_ringing_calls(
+            conversation=conversation
+        )
 
         existing_call = CallSession.objects.filter(
             conversation=conversation,
