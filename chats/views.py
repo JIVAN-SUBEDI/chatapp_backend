@@ -1346,6 +1346,51 @@ class StartCallView(APIView):
         sent = 0
         # print("items:"+item)
         print("it is a item")
+        print("====================================")
+        print("INVITED USER IDS:", invited_user_ids)
+
+        print(
+            "ALL FCM TOKENS:",
+            list(
+                UserFCMToken.objects.all().values(
+                    "id",
+                    "user_id",
+                    "token",
+                    "is_active",
+                )
+            )
+        )
+
+        print(
+            "TOKENS FOR INVITED USERS:",
+            list(
+                UserFCMToken.objects.filter(
+                    user_id__in=invited_user_ids
+                ).values(
+                    "id",
+                    "user_id",
+                    "token",
+                    "is_active",
+                )
+            )
+        )
+
+        print(
+            "ACTIVE TOKENS:",
+            list(
+                UserFCMToken.objects.filter(
+                    user_id__in=invited_user_ids,
+                    is_active=True,
+                ).values(
+                    "id",
+                    "user_id",
+                    "token",
+                    "is_active",
+                )
+            )
+        )
+
+        print("====================================")
         for item in tokens.iterator():
             print("actually called things")
             try:
