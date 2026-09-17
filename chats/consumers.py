@@ -134,7 +134,26 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "action": "edit_message",
             "message": event["message"],
         }))
+    async def call_event(self, event):
+        print("========== CHAT CALL EVENT ==========")
+        print("event:", event)
+        print("=====================================")
 
+        data = (
+            event.get("data")
+            or event.get("message")
+            or event.get("payload")
+            or {}
+        )
+
+        await self.send(
+            text_data=json.dumps({
+                "action": "call_event",
+                "event": "call_event",
+                "type": "call_event",
+                "data": data,
+            })
+        )
     @database_sync_to_async
     def check_member(self):
         return ConversationMember.objects.filter(
