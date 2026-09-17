@@ -29,7 +29,8 @@ def delete_bad_fcm_token(token):
 
 def send_incoming_call_push(*, token, call_data):
     init_firebase()
-
+    print("token:"+token)
+    
     if not token:
         print("FCM incoming call skipped: receiver has no FCM token")
         return None
