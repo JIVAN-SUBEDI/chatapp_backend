@@ -1344,7 +1344,7 @@ class StartCallView(APIView):
         )
 
         sent = 0
-
+    
         for item in tokens.iterator():
             try:
                 send_incoming_call_push(
