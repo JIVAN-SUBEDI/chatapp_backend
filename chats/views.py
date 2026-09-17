@@ -1344,7 +1344,7 @@ class StartCallView(APIView):
         )
 
         sent = 0
-        print("items:"+item)
+        # print("items:"+item)
         print("it is a item")
         for item in tokens.iterator():
             print("actually called things")
