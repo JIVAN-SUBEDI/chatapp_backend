@@ -1340,7 +1340,7 @@ class StartCallView(APIView):
 
         tokens = UserFCMToken.objects.filter(
             user_id__in=invited_user_ids,
-            is_active=True,
+            # is_active=True,
         )
 
         sent = 0
