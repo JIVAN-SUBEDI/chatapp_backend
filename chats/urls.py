@@ -18,7 +18,7 @@ from .views import (
     UnblockGroupMemberView,
     BlockPrivateUserView,
     UnblockPrivateUserView,
-    UpdateMemberNicknameView,SaveFCMTokenView,StartCallView,UpdateCallStatusView
+    UpdateMemberNicknameView,SaveFCMTokenView,StartCallView,UpdateCallStatusView,ActiveGroupCallView,LiveKitTokenView
 )
 
 urlpatterns = [
@@ -48,4 +48,6 @@ urlpatterns = [
     path("fcm-token/",SaveFCMTokenView.as_view(),name="save-fcm-token"),
     path("calls/start/", StartCallView.as_view(), name="start-call"),
     path("calls/<int:call_id>/status/", UpdateCallStatusView.as_view(), name="update-call-status"),
+    path("calls/livekit-token/",LiveKitTokenView.as_view(),name="livekit-token",),
+    path("conversations/<int:conversation_id>/active-call/",ActiveGroupCallView.as_view(),name="active-group-call",),
 ]

@@ -1460,21 +1460,46 @@ class LiveKitTokenView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        # is_group_call = call.conversation.type == Conversation.GROUP
+
         participant = CallParticipant.objects.filter(
             call=call,
             user=request.user,
         ).first()
 
+
+        # ------------------------------------------------------------
+        # GROUP CALL:
+        # Any CURRENT active group member may join an ongoing call.
+        #
+        # This also supports:
+        # - user left and joins again
+        # - user declined and joins later
+        # - user missed and joins later
+        # - user was added to group after call started
+        # ------------------------------------------------------------
+        if not participant :
+            participant = CallParticipant.objects.create(
+                call=call,
+                user=request.user,
+                status=CallParticipant.INVITED,
+            )
+
+
+        # Private calls must already contain the participant.
         if not participant:
             return Response(
-                {"error": "You were not invited to this call"},
+                {"error": "You are not allowed to join this call"},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        if participant.status in {
-            CallParticipant.DECLINED,
-            CallParticipant.MISSED,
-        }:
+
+        # For PRIVATE calls preserve existing decline/missed behaviour.
+        if (participant.status in {
+                CallParticipant.DECLINED,
+                CallParticipant.MISSED,
+            }
+        ):
             return Response(
                 {"error": "You already declined or missed this call"},
                 status=status.HTTP_409_CONFLICT,
@@ -1554,13 +1579,20 @@ class LiveKitTokenView(APIView):
         update_fields = ["status"]
         participant.status = CallParticipant.JOINED
 
-        if participant.joined_at is None:
-            participant.joined_at = joined_at
-            update_fields.append("joined_at")
+        joined_at = timezone.now()
 
+        participant.status = CallParticipant.JOINED
+        participant.joined_at = joined_at
         participant.left_at = None
-        update_fields.append("left_at")
-        participant.save(update_fields=update_fields)
+
+        participant.save(
+            update_fields=[
+                "status",
+                "joined_at",
+                "left_at",
+            ]
+        )
+
 
         # The caller joining should not count as the call being answered.
         if (
@@ -1773,14 +1805,64 @@ class UpdateCallStatusView(APIView):
                 participant.left_at = now
 
             elif action in {"ended", "leave"}:
-                if is_group_call and not is_caller:
+
+                # ========================================================
+                # GROUP CALL
+                # ========================================================
+                if is_group_call:
+
+                    # In a group call there is no special "owner" once
+                    # the call is running.
+                    #
+                    # Caller leaving should behave exactly like any
+                    # other participant leaving.
                     participant.status = CallParticipant.LEFT
                     participant.left_at = now
-                    participant.save(update_fields=["status", "left_at"])
+
+                    participant.save(
+                        update_fields=[
+                            "status",
+                            "left_at",
+                        ]
+                    )
+
+                    # Check whether anyone is still actually inside
+                    # the group call.
+                    anyone_still_joined = (
+                        CallParticipant.objects
+                        .filter(
+                            call=call,
+                            status=CallParticipant.JOINED,
+                        )
+                        .exists()
+                    )
+
+                    # Only end the CallSession when EVERYONE has left.
+                    if not anyone_still_joined:
+                        call.status = CallSession.ENDED
+                        call.ended_at = now
+
+                        call.save(
+                            update_fields=[
+                                "status",
+                                "ended_at",
+                            ]
+                        )
+
+
+                # ========================================================
+                # PRIVATE CALL
+                # ========================================================
                 else:
                     call.status = CallSession.ENDED
                     call.ended_at = now
-                    call.save(update_fields=["status", "ended_at"])
+
+                    call.save(
+                        update_fields=[
+                            "status",
+                            "ended_at",
+                        ]
+                    )
 
                     CallParticipant.objects.filter(
                         call=call,
@@ -1788,6 +1870,7 @@ class UpdateCallStatusView(APIView):
                         status=CallParticipant.LEFT,
                         left_at=now,
                     )
+
                     participant.status = CallParticipant.LEFT
                     participant.left_at = now
 
@@ -1807,4 +1890,121 @@ class UpdateCallStatusView(APIView):
                 **_serialize_call(call),
                 "participant_status": participant.status,
             }
+        )
+
+class ActiveGroupCallView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, conversation_id):
+
+        membership = (
+            ConversationMember.objects
+            .select_related("conversation")
+            .filter(
+                conversation_id=conversation_id,
+                user=request.user,
+                is_blocked=False,
+            )
+            .first()
+        )
+
+        if not membership:
+            return Response(
+                {"error": "You are not a member of this group"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        conversation = membership.conversation
+
+        if conversation.type != Conversation.GROUP:
+            return Response(
+                {"error": "This is not a group conversation"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        call = (
+            CallSession.objects
+            .filter(
+                conversation=conversation,
+                status__in=[
+                    CallSession.RINGING,
+                    CallSession.ACCEPTED,
+                ],
+            )
+            .select_related(
+                "caller",
+                "conversation",
+            )
+            .first()
+        )
+
+        if not call:
+            return Response(
+                {
+                    "active": False,
+                    "call": None,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        # User may have been added to the group after
+        # the call originally started.
+        participant, _ = CallParticipant.objects.get_or_create(
+            call=call,
+            user=request.user,
+            defaults={
+                "status": CallParticipant.INVITED,
+            },
+        )
+
+        participants = []
+
+        for item in (
+            CallParticipant.objects
+            .filter(call=call)
+            .select_related("user")
+        ):
+            participants.append({
+                "user_id": item.user_id,
+                "name": _user_display_name(item.user),
+                "profile_picture": _user_avatar_url(
+                    request,
+                    item.user,
+                ),
+                "status": item.status,
+                "joined_at": (
+                    item.joined_at.isoformat()
+                    if item.joined_at
+                    else None
+                ),
+                "left_at": (
+                    item.left_at.isoformat()
+                    if item.left_at
+                    else None
+                ),
+            })
+
+        return Response(
+            {
+                "active": True,
+
+                "call": {
+                    **_serialize_call(call),
+
+                    "livekit_room_name":
+                        call.livekit_room_name,
+
+                    "conversation_name":
+                        conversation.name or "",
+
+                    "my_participant_status":
+                        participant.status,
+
+                    "can_join": True,
+
+                    "participants":
+                        participants,
+                },
+            },
+            status=status.HTTP_200_OK,
         )
