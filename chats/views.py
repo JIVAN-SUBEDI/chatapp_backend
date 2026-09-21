@@ -157,39 +157,151 @@ class CreateGroupChatView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        name = request.data.get("name")
-        member_ids = request.data.get("member_ids", [])
+        name = str(request.data.get("name", "")).strip()
 
         if not name:
-            return Response({"error": "Group name is required"}, status=400)
+            return Response(
+                {"error": "Group name is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        conversation = Conversation.objects.create(
-            type=Conversation.GROUP,
-            name=name,
-            image=request.FILES.get("image"),
-            created_by=request.user
+        # ---------------------------------------------------------
+        # READ MEMBER IDS
+        # Dio multipart may send member_ids in different forms.
+        # Support:
+        # member_ids=1&member_ids=2
+        # member_ids[]=1&member_ids[]=2
+        # member_ids=["1","2"]
+        # ---------------------------------------------------------
+
+        member_ids = request.data.getlist("member_ids")
+
+        if not member_ids:
+            member_ids = request.data.getlist("member_ids[]")
+
+        # If DRF received a normal list
+        if not member_ids:
+            raw_member_ids = request.data.get("member_ids", [])
+
+            if isinstance(raw_member_ids, list):
+                member_ids = raw_member_ids
+
+            elif raw_member_ids:
+                # Could be JSON string
+                try:
+                    decoded = json.loads(raw_member_ids)
+
+                    if isinstance(decoded, list):
+                        member_ids = decoded
+                    else:
+                        member_ids = [raw_member_ids]
+
+                except (json.JSONDecodeError, TypeError):
+                    member_ids = [raw_member_ids]
+
+        # ---------------------------------------------------------
+        # CLEAN IDS
+        # ---------------------------------------------------------
+
+        cleaned_member_ids = []
+
+        for value in member_ids:
+            try:
+                user_id = int(value)
+
+                if user_id != request.user.id:
+                    cleaned_member_ids.append(user_id)
+
+            except (TypeError, ValueError):
+                continue
+
+        cleaned_member_ids = list(set(cleaned_member_ids))
+
+        # ---------------------------------------------------------
+        # IMPORTANT:
+        # Flutter sends "group_image", not "image".
+        # ---------------------------------------------------------
+
+        group_image = (
+            request.FILES.get("group_image")
+            or request.FILES.get("image")
         )
 
-        ConversationMember.objects.create(
-            conversation=conversation,
-            user=request.user,
-            is_admin=True
-        )
+        try:
+            with transaction.atomic():
 
-        users = User.objects.filter(id__in=member_ids)
-
-        for user in users:
-            if user != request.user:
-                ConversationMember.objects.get_or_create(
-                    conversation=conversation,
-                    user=user
+                conversation = Conversation.objects.create(
+                    type=Conversation.GROUP,
+                    name=name,
+                    image=group_image,
+                    created_by=request.user,
                 )
 
-        return Response(
-            ConversationSerializer(conversation).data,
-            status=status.HTTP_201_CREATED
+                # Creator = member + admin
+                ConversationMember.objects.create(
+                    conversation=conversation,
+                    user=request.user,
+                    is_admin=True,
+                )
+
+                users = User.objects.filter(
+                    id__in=cleaned_member_ids
+                )
+
+                for user in users:
+                    ConversationMember.objects.get_or_create(
+                        conversation=conversation,
+                        user=user,
+                        defaults={
+                            "is_admin": False,
+                        },
+                    )
+
+        except Exception as exc:
+            return Response(
+                {
+                    "error": "Unable to create group",
+                    "details": str(exc),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ---------------------------------------------------------
+        # SERIALIZE COMPLETE GROUP
+        # ---------------------------------------------------------
+
+        data = ConversationSerializer(
+            conversation,
+            context={"request": request},
+        ).data
+
+        print("")
+        print("======================================")
+        print("GROUP CREATED")
+        print("GROUP ID:", conversation.id)
+        print("GROUP NAME:", conversation.name)
+        print("CREATOR:", request.user.id)
+        print("REQUEST MEMBER IDS:", member_ids)
+        print("CLEAN MEMBER IDS:", cleaned_member_ids)
+        print(
+            "ACTUAL MEMBERS:",
+            list(
+                ConversationMember.objects.filter(
+                    conversation=conversation
+                ).values_list(
+                    "user_id",
+                    flat=True,
+                )
+            ),
         )
-# Add this view in your chat/views.py
+        print("SERIALIZED GROUP:", data)
+        print("======================================")
+        print("")
+
+        return Response(
+            data,
+            status=status.HTTP_201_CREATED,
+        )
 
 class UpdateGroupInfoView(APIView):
     permission_classes = [permissions.IsAuthenticated]
