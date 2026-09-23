@@ -274,7 +274,32 @@ class CreateGroupChatView(APIView):
             conversation,
             context={"request": request},
         ).data
+        # ============================================================
+        # REALTIME: NOTIFY EVERY GROUP MEMBER
+        # ============================================================
 
+        channel_layer = get_channel_layer()
+
+        actual_member_ids = list(
+            ConversationMember.objects.filter(
+                conversation=conversation,
+                is_blocked=False,
+            ).values_list(
+                "user_id",
+                flat=True,
+            )
+        )
+
+        for user_id in actual_member_ids:
+            async_to_sync(
+                channel_layer.group_send
+            )(
+                f"user_chat_{user_id}",
+                {
+                    "type": "conversation_created",
+                    "data": data,
+                },
+            )
         print("")
         print("======================================")
         print("GROUP CREATED")

@@ -256,3 +256,69 @@ class ChatConsumer(AsyncWebsocketConsumer):
             return {
                 "error": "Message not found"
             }
+
+class GlobalChatConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        self.user = self.scope["user"]
+
+        if self.user.is_anonymous:
+            await self.close()
+            return
+
+        self.user_group_name = f"user_chat_{self.user.id}"
+
+        await self.channel_layer.group_add(
+            self.user_group_name,
+            self.channel_name,
+        )
+
+        await self.accept()
+
+        print(
+            f"GLOBAL CHAT WS CONNECTED: "
+            f"user={self.user.id}"
+        )
+
+    async def disconnect(self, close_code):
+        if hasattr(self, "user_group_name"):
+            await self.channel_layer.group_discard(
+                self.user_group_name,
+                self.channel_name,
+            )
+
+        print(
+            f"GLOBAL CHAT WS DISCONNECTED: "
+            f"user={getattr(self.user, 'id', None)}"
+        )
+
+    async def conversation_created(self, event):
+        await self.send(
+            text_data=json.dumps({
+                "type": "conversation_created",
+                "data": event["data"],
+            })
+        )
+
+    async def conversation_updated(self, event):
+        await self.send(
+            text_data=json.dumps({
+                "type": "conversation_updated",
+                "data": event["data"],
+            })
+        )
+
+    async def conversation_deleted(self, event):
+        await self.send(
+            text_data=json.dumps({
+                "type": "conversation_deleted",
+                "data": event["data"],
+            })
+        )
+
+    async def new_message(self, event):
+        await self.send(
+            text_data=json.dumps({
+                "type": "new_message",
+                "data": event["data"],
+            })
+        )
