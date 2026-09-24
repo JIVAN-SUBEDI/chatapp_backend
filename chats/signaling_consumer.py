@@ -27,13 +27,18 @@ CALL_VIDEO_UPGRADE_REJECTED = "call_video_upgrade_rejected"
 
 
 class GlobalCallConsumer(AsyncWebsocketConsumer):
+
     async def connect(self):
         self.user = self.scope["user"]
 
-        print("========== GLOBAL CALL CONNECT ==========")
+        print("")
+        print("==========================================")
+        print("### GLOBAL CALL CONNECT")
+        print("==========================================")
         print("user:", self.user)
+        print("user_id:", getattr(self.user, "id", None))
         print("is_anonymous:", self.user.is_anonymous)
-        print("=========================================")
+        print("==========================================")
 
         if self.user.is_anonymous:
             print("GLOBAL CALL CONNECT REJECTED: anonymous user")
@@ -49,9 +54,11 @@ class GlobalCallConsumer(AsyncWebsocketConsumer):
 
         await self.accept()
 
-        print("GLOBAL CALL CONNECTED")
+        print("")
+        print("### GLOBAL CALL CONNECTED SUCCESSFULLY")
         print("user_id:", self.user.id)
         print("group_name:", self.group_name)
+        print("channel_name:", self.channel_name)
 
         await self.send_json({
             "event": "global_call_connected",
@@ -63,10 +70,21 @@ class GlobalCallConsumer(AsyncWebsocketConsumer):
         })
 
     async def disconnect(self, close_code):
-        print("========== GLOBAL CALL DISCONNECT ==========")
-        print("user:", getattr(self, "user", None))
+        print("")
+        print("==========================================")
+        print("### GLOBAL CALL DISCONNECT")
+        print("==========================================")
+        print(
+            "user_id:",
+            getattr(
+                getattr(self, "user", None),
+                "id",
+                None,
+            ),
+        )
         print("close_code:", close_code)
-        print("===========================================")
+        print("group_name:", getattr(self, "group_name", None))
+        print("==========================================")
 
         if hasattr(self, "group_name"):
             await self.channel_layer.group_discard(
@@ -74,23 +92,112 @@ class GlobalCallConsumer(AsyncWebsocketConsumer):
                 self.channel_name,
             )
 
-    async def incoming_call(self, event):
-        print("========== GLOBAL INCOMING CALL EVENT ==========")
-        print("event:", event)
-        print("===============================================")
+    # ============================================================
+    # CLIENT -> GLOBAL SOCKET
+    # ============================================================
 
-        await self.send_json(event.get("data", {}))
+    async def receive(self, text_data=None, bytes_data=None):
+
+        if not text_data:
+            return
+
+        try:
+            data = json.loads(text_data)
+        except json.JSONDecodeError:
+            print("GLOBAL CALL WS: invalid JSON")
+            return
+
+        event = (
+            data.get("event")
+            or data.get("type")
+            or data.get("action")
+            or ""
+        )
+
+        event = str(event).strip().lower()
+
+        # --------------------------------------------------------
+        # HEARTBEAT
+        # Flutter sends:
+        #
+        # {
+        #   "event": "ping",
+        #   "type": "ping",
+        #   "action": "ping"
+        # }
+        #
+        # It expects pong.
+        # --------------------------------------------------------
+
+        if event == "ping":
+            await self.send_json({
+                "event": "pong",
+                "type": "pong",
+                "action": "pong",
+                "payload": {
+                    "user_id": str(self.user.id),
+                },
+            })
+
+            return
+
+        # Allow client pong as well if required later.
+        if event == "pong":
+            return
+
+        print(
+            "GLOBAL CALL WS UNKNOWN CLIENT EVENT:",
+            event,
+        )
+
+    # ============================================================
+    # SERVER -> CLIENT: INCOMING CALL
+    # ============================================================
+
+    async def incoming_call(self, event):
+        print("")
+        print("==========================================")
+        print("### GLOBAL INCOMING CALL EVENT")
+        print("==========================================")
+        print("user_id:", self.user.id)
+        print("group_name:", self.group_name)
+        print("event:", event)
+        print("==========================================")
+
+        data = event.get("data") or {}
+
+        await self.send_json(data)
+
+    # ============================================================
+    # SERVER -> CLIENT: CALL CANCELLED
+    # ============================================================
 
     async def call_cancelled(self, event):
-        print("========== GLOBAL CALL CANCELLED EVENT ==========")
+        print("")
+        print("==========================================")
+        print("### GLOBAL CALL CANCELLED EVENT")
+        print("==========================================")
+        print("user_id:", self.user.id)
         print("event:", event)
-        print("================================================")
+        print("==========================================")
 
-        await self.send_json(event.get("data", {}))
+        data = event.get("data") or {}
+
+        await self.send_json(data)
+
+    # ============================================================
+    # JSON SEND HELPER
+    # ============================================================
 
     async def send_json(self, data):
-        print("GLOBAL SEND JSON:", data)
-        await self.send(text_data=json.dumps(data))
+        print(
+            "GLOBAL CALL WS SEND:",
+            data.get("event") or data.get("type"),
+        )
+
+        await self.send(
+            text_data=json.dumps(data),
+        )
 
 
 class CallSignalingConsumer(AsyncWebsocketConsumer):
