@@ -181,18 +181,28 @@ class ChatConsumer(AsyncWebsocketConsumer):
         return {
             "id": message.id,
             "conversation": message.conversation_id,
+
             "sender": {
                 "id": self.user.id,
                 "phone": self.user.phone,
-            
+                "full_name": self.user.full_name or "",
+                "profile_picture": (
+                    self.user.profile_picture.url
+                    if self.user.profile_picture
+                    else None
+                ),
             },
+
             "message_type": message.message_type,
             "text": message.text,
+
             "reply_to": message.reply_to_id,
             "reaction_to": message.reaction_to_id,
             "reaction": message.reaction,
+
             "is_edited": message.is_edited,
             "is_deleted": message.is_deleted,
+
             "created_at": message.created_at.isoformat(),
         }
 
