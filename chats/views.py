@@ -1198,6 +1198,51 @@ def _serialize_call(call):
             else None
         ),
     }
+def _end_call_if_no_joined_participants(call):
+    """
+    End an active call when nobody is actually marked JOINED.
+
+    Returns True if the CallSession was ended.
+    """
+
+    if call.status not in {
+        CallSession.RINGING,
+        CallSession.ACCEPTED,
+    }:
+        return False
+
+    has_joined = CallParticipant.objects.filter(
+        call=call,
+        status=CallParticipant.JOINED,
+    ).exists()
+
+    if has_joined:
+        return False
+
+    now = timezone.now()
+
+    call.status = CallSession.ENDED
+    call.ended_at = now
+
+    call.save(
+        update_fields=[
+            "status",
+            "ended_at",
+        ]
+    )
+
+    CallParticipant.objects.filter(
+        call=call,
+        status__in=[
+            CallParticipant.RINGING,
+            CallParticipant.INVITED,
+        ],
+    ).update(
+        status=CallParticipant.LEFT,
+        left_at=now,
+    )
+
+    return True
 # ============================================================
 # CALL TIMEOUT
 # ============================================================
@@ -1389,25 +1434,84 @@ class StartCallView(APIView):
             conversation=conversation
         )
 
-        existing_call = CallSession.objects.filter(
-            conversation=conversation,
-            status__in=[
-                CallSession.RINGING,
-                CallSession.ACCEPTED,
-            ],
-        ).first()
+        existing_call = (
+            CallSession.objects
+            .filter(
+                conversation=conversation,
+                status__in=[
+                    CallSession.RINGING,
+                    CallSession.ACCEPTED,
+                ],
+            )
+            .order_by("-created_at")
+            .first()
+        )
 
         if existing_call:
+
+            # ---------------------------------------------------------
+            # REPAIR CALL THAT HAS NO JOINED PARTICIPANTS
+            # ---------------------------------------------------------
+
+            has_joined_participants = (
+                CallParticipant.objects
+                .filter(
+                    call=existing_call,
+                    status=CallParticipant.JOINED,
+                )
+                .exists()
+            )
+
+            # ACCEPTED call but nobody is joined anymore =
+            # stale/dead call.
+            if (
+                existing_call.status == CallSession.ACCEPTED
+                and not has_joined_participants
+            ):
+
+                now = timezone.now()
+
+                existing_call.status = CallSession.ENDED
+                existing_call.ended_at = now
+
+                existing_call.save(
+                    update_fields=[
+                        "status",
+                        "ended_at",
+                    ]
+                )
+
+                CallParticipant.objects.filter(
+                    call=existing_call,
+                ).exclude(
+                    status__in=[
+                        CallParticipant.DECLINED,
+                        CallParticipant.MISSED,
+                    ],
+                ).update(
+                    status=CallParticipant.LEFT,
+                    left_at=now,
+                )
+
+                existing_call = None
+
+
+        if existing_call:
+
             return Response(
                 {
-                    "error": "A call is already active in this conversation",
+                    "error": (
+                        "A call is already active "
+                        "in this conversation"
+                    ),
                     "call_id": existing_call.id,
-                    "call_uuid": str(existing_call.call_uuid),
+                    "call_uuid": str(
+                        existing_call.call_uuid
+                    ),
                     "status": existing_call.status,
                 },
                 status=status.HTTP_409_CONFLICT,
             )
-
         now = timezone.now()
 
         try:
@@ -1597,31 +1701,36 @@ class LiveKitTokenView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # is_group_call = call.conversation.type == Conversation.GROUP
 
-        participant = CallParticipant.objects.filter(
-            call=call,
-            user=request.user,
-        ).first()
+        is_group_call = (
+            call.conversation.type
+            == Conversation.GROUP
+        )
 
+        participant = (
+            CallParticipant.objects
+            .filter(
+                call=call,
+                user=request.user,
+            )
+            .first()
+        )
 
-        # ------------------------------------------------------------
-        # GROUP CALL:
-        # Any CURRENT active group member may join an ongoing call.
-        #
-        # This also supports:
-        # - user left and joins again
-        # - user declined and joins later
-        # - user missed and joins later
-        # - user was added to group after call started
-        # ------------------------------------------------------------
-        if not participant :
+        if not participant and is_group_call:
             participant = CallParticipant.objects.create(
                 call=call,
                 user=request.user,
                 status=CallParticipant.INVITED,
             )
 
+        if not participant:
+            return Response(
+                {
+                    "error":
+                    "You are not allowed to join this call"
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         # Private calls must already contain the participant.
         if not participant:
@@ -1632,13 +1741,18 @@ class LiveKitTokenView(APIView):
 
 
         # For PRIVATE calls preserve existing decline/missed behaviour.
-        if (participant.status in {
+        if (
+            not is_group_call
+            and participant.status in {
                 CallParticipant.DECLINED,
                 CallParticipant.MISSED,
             }
         ):
             return Response(
-                {"error": "You already declined or missed this call"},
+                {
+                    "error":
+                    "You already declined or missed this call"
+                },
                 status=status.HTTP_409_CONFLICT,
             )
 
@@ -1773,7 +1887,28 @@ class UpdateCallStatusView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, call_id):
-        action = str(request.data.get("action", "")).strip().lower()
+
+        raw_action = str(
+            request.data.get("action", "")
+        ).strip().lower()
+
+        # ---------------------------------------------------------
+        # NORMALIZE CLIENT ACTIONS
+        # ---------------------------------------------------------
+
+        action_aliases = {
+            "end": "ended",
+            "hangup": "ended",
+            "hang_up": "ended",
+            "disconnect": "leave",
+            "disconnected": "leave",
+            "left": "leave",
+        }
+
+        action = action_aliases.get(
+            raw_action,
+            raw_action,
+        )
 
         valid_actions = {
             "accept",
@@ -1786,12 +1921,19 @@ class UpdateCallStatusView(APIView):
 
         if action not in valid_actions:
             return Response(
-                {"error": "Invalid action"},
+                {
+                    "error": "Invalid action",
+                    "received_action": raw_action,
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         with transaction.atomic():
-            call = _get_call_session(call_id, lock=True)
+
+            call = _get_call_session(
+                call_id,
+                lock=True,
+            )
 
             if not call:
                 return Response(
@@ -1799,10 +1941,15 @@ class UpdateCallStatusView(APIView):
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
-            participant = CallParticipant.objects.select_for_update().filter(
-                call=call,
-                user=request.user,
-            ).first()
+            participant = (
+                CallParticipant.objects
+                .select_for_update()
+                .filter(
+                    call=call,
+                    user=request.user,
+                )
+                .first()
+            )
 
             if not participant:
                 return Response(
@@ -1811,10 +1958,23 @@ class UpdateCallStatusView(APIView):
                 )
 
             now = timezone.now()
-            is_group_call = call.conversation.type == Conversation.GROUP
-            is_caller = request.user.id == call.caller_id
+
+            is_group_call = (
+                call.conversation.type
+                == Conversation.GROUP
+            )
+
+            is_caller = (
+                request.user.id
+                == call.caller_id
+            )
+
+            # =====================================================
+            # ACCEPT
+            # =====================================================
 
             if action == "accept":
+
                 if call.status in {
                     CallSession.ENDED,
                     CallSession.REJECTED,
@@ -1822,13 +1982,24 @@ class UpdateCallStatusView(APIView):
                     CallSession.CANCELLED,
                 }:
                     return Response(
-                        {"error": "This call is no longer active"},
+                        {
+                            "error":
+                            "This call is no longer active"
+                        },
                         status=status.HTTP_409_CONFLICT,
                     )
 
-                participant.status = CallParticipant.JOINED
-                participant.joined_at = participant.joined_at or now
+                participant.status = (
+                    CallParticipant.JOINED
+                )
+
+                participant.joined_at = (
+                    participant.joined_at
+                    or now
+                )
+
                 participant.left_at = None
+
                 participant.save(
                     update_fields=[
                         "status",
@@ -1837,95 +2008,248 @@ class UpdateCallStatusView(APIView):
                     ]
                 )
 
-                if not is_caller and call.status == CallSession.RINGING:
-                    call.status = CallSession.ACCEPTED
+                if (
+                    not is_caller
+                    and call.status
+                    == CallSession.RINGING
+                ):
+                    call.status = (
+                        CallSession.ACCEPTED
+                    )
+
                     call.answered_at = now
-                    call.save(update_fields=["status", "answered_at"])
+
+                    call.save(
+                        update_fields=[
+                            "status",
+                            "answered_at",
+                        ]
+                    )
+
+            # =====================================================
+            # REJECT
+            # =====================================================
 
             elif action == "reject":
+
                 if is_caller:
                     return Response(
                         {
-                            "error": (
-                                "The caller must cancel or end the call"
-                            )
+                            "error":
+                            "Caller must cancel the call"
                         },
                         status=status.HTTP_400_BAD_REQUEST,
                     )
 
-                participant.status = CallParticipant.DECLINED
+                participant.status = (
+                    CallParticipant.DECLINED
+                )
+
                 participant.left_at = now
-                participant.save(update_fields=["status", "left_at"])
+
+                participant.save(
+                    update_fields=[
+                        "status",
+                        "left_at",
+                    ]
+                )
+
+                # -----------------------------------------------
+                # PRIVATE CALL
+                # -----------------------------------------------
 
                 if not is_group_call:
-                    call.status = CallSession.REJECTED
+
+                    call.status = (
+                        CallSession.REJECTED
+                    )
+
                     call.ended_at = now
-                    call.save(update_fields=["status", "ended_at"])
-                else:
-                    remaining = CallParticipant.objects.filter(
+
+                    call.save(
+                        update_fields=[
+                            "status",
+                            "ended_at",
+                        ]
+                    )
+
+                    # Caller is no longer active either
+                    CallParticipant.objects.filter(
                         call=call,
                     ).exclude(
-                        user_id=call.caller_id,
-                    ).filter(
-                        status__in=[
-                            CallParticipant.RINGING,
-                            CallParticipant.JOINED,
-                        ]
-                    ).exists()
+                        user=request.user,
+                    ).update(
+                        status=CallParticipant.LEFT,
+                        left_at=now,
+                    )
 
-                    if not remaining and call.status == CallSession.RINGING:
-                        call.status = CallSession.REJECTED
+                # -----------------------------------------------
+                # GROUP CALL
+                # -----------------------------------------------
+
+                else:
+
+                    joined_exists = (
+                        CallParticipant.objects
+                        .filter(
+                            call=call,
+                            status=CallParticipant.JOINED,
+                        )
+                        .exists()
+                    )
+
+                    ringing_exists = (
+                        CallParticipant.objects
+                        .filter(
+                            call=call,
+                            status=CallParticipant.RINGING,
+                        )
+                        .exists()
+                    )
+
+                    if (
+                        not joined_exists
+                        and not ringing_exists
+                    ):
+                        call.status = (
+                            CallSession.REJECTED
+                        )
+
                         call.ended_at = now
-                        call.save(update_fields=["status", "ended_at"])
+
+                        call.save(
+                            update_fields=[
+                                "status",
+                                "ended_at",
+                            ]
+                        )
+
+            # =====================================================
+            # MISSED
+            # =====================================================
 
             elif action == "missed":
+
                 if is_caller:
                     return Response(
-                        {"error": "The caller cannot mark the call missed"},
+                        {
+                            "error":
+                            "Caller cannot mark call missed"
+                        },
                         status=status.HTTP_400_BAD_REQUEST,
                     )
 
-                participant.status = CallParticipant.MISSED
+                participant.status = (
+                    CallParticipant.MISSED
+                )
+
                 participant.left_at = now
-                participant.save(update_fields=["status", "left_at"])
+
+                participant.save(
+                    update_fields=[
+                        "status",
+                        "left_at",
+                    ]
+                )
 
                 if not is_group_call:
-                    call.status = CallSession.MISSED
+
+                    call.status = (
+                        CallSession.MISSED
+                    )
+
                     call.ended_at = now
-                    call.save(update_fields=["status", "ended_at"])
-                else:
-                    remaining = CallParticipant.objects.filter(
+
+                    call.save(
+                        update_fields=[
+                            "status",
+                            "ended_at",
+                        ]
+                    )
+
+                    CallParticipant.objects.filter(
                         call=call,
                     ).exclude(
-                        user_id=call.caller_id,
-                    ).filter(
-                        status__in=[
-                            CallParticipant.RINGING,
-                            CallParticipant.JOINED,
-                        ]
-                    ).exists()
+                        user=request.user,
+                    ).update(
+                        status=CallParticipant.LEFT,
+                        left_at=now,
+                    )
 
-                    if not remaining and call.status == CallSession.RINGING:
-                        call.status = CallSession.MISSED
+                else:
+
+                    joined_exists = (
+                        CallParticipant.objects
+                        .filter(
+                            call=call,
+                            status=CallParticipant.JOINED,
+                        )
+                        .exists()
+                    )
+
+                    ringing_exists = (
+                        CallParticipant.objects
+                        .filter(
+                            call=call,
+                            status=CallParticipant.RINGING,
+                        )
+                        .exists()
+                    )
+
+                    if (
+                        not joined_exists
+                        and not ringing_exists
+                    ):
+                        call.status = (
+                            CallSession.MISSED
+                        )
+
                         call.ended_at = now
-                        call.save(update_fields=["status", "ended_at"])
+
+                        call.save(
+                            update_fields=[
+                                "status",
+                                "ended_at",
+                            ]
+                        )
+
+            # =====================================================
+            # CALLER CANCELS BEFORE ANSWER
+            # =====================================================
 
             elif action == "cancel":
+
                 if not is_caller:
                     return Response(
-                        {"error": "Only the caller can cancel the call"},
+                        {
+                            "error":
+                            "Only caller can cancel call"
+                        },
                         status=status.HTTP_403_FORBIDDEN,
                     )
 
                 if call.status != CallSession.RINGING:
+
                     return Response(
-                        {"error": "Only a ringing call can be cancelled"},
+                        {
+                            "error":
+                            "Only ringing call can be cancelled"
+                        },
                         status=status.HTTP_409_CONFLICT,
                     )
 
-                call.status = CallSession.CANCELLED
+                call.status = (
+                    CallSession.CANCELLED
+                )
+
                 call.ended_at = now
-                call.save(update_fields=["status", "ended_at"])
+
+                call.save(
+                    update_fields=[
+                        "status",
+                        "ended_at",
+                    ]
+                )
 
                 CallParticipant.objects.filter(
                     call=call,
@@ -1938,60 +2262,51 @@ class UpdateCallStatusView(APIView):
                     status=CallParticipant.LEFT,
                     left_at=now,
                 )
-                participant.status = CallParticipant.LEFT
+
+                participant.status = (
+                    CallParticipant.LEFT
+                )
+
                 participant.left_at = now
 
-            elif action in {"ended", "leave"}:
+            # =====================================================
+            # LEAVE / END / DISCONNECT
+            # =====================================================
 
-                # ========================================================
-                # GROUP CALL
-                # ========================================================
-                if is_group_call:
+            elif action in {
+                "ended",
+                "leave",
+            }:
 
-                    # In a group call there is no special "owner" once
-                    # the call is running.
-                    #
-                    # Caller leaving should behave exactly like any
-                    # other participant leaving.
-                    participant.status = CallParticipant.LEFT
-                    participant.left_at = now
+                # -----------------------------------------------
+                # ALWAYS mark the current user LEFT first
+                # -----------------------------------------------
 
-                    participant.save(
-                        update_fields=[
-                            "status",
-                            "left_at",
-                        ]
-                    )
+                participant.status = (
+                    CallParticipant.LEFT
+                )
 
-                    # Check whether anyone is still actually inside
-                    # the group call.
-                    anyone_still_joined = (
-                        CallParticipant.objects
-                        .filter(
-                            call=call,
-                            status=CallParticipant.JOINED,
-                        )
-                        .exists()
-                    )
+                participant.left_at = now
 
-                    # Only end the CallSession when EVERYONE has left.
-                    if not anyone_still_joined:
-                        call.status = CallSession.ENDED
-                        call.ended_at = now
+                participant.save(
+                    update_fields=[
+                        "status",
+                        "left_at",
+                    ]
+                )
 
-                        call.save(
-                            update_fields=[
-                                "status",
-                                "ended_at",
-                            ]
-                        )
-
-
-                # ========================================================
+                # ===============================================
                 # PRIVATE CALL
-                # ========================================================
-                else:
-                    call.status = CallSession.ENDED
+                # ===============================================
+
+                if not is_group_call:
+
+                    # One person leaving a private call means
+                    # the whole call is finished.
+                    call.status = (
+                        CallSession.ENDED
+                    )
+
                     call.ended_at = now
 
                     call.save(
@@ -2003,30 +2318,96 @@ class UpdateCallStatusView(APIView):
 
                     CallParticipant.objects.filter(
                         call=call,
+                    ).exclude(
+                        user=request.user,
                     ).update(
                         status=CallParticipant.LEFT,
                         left_at=now,
                     )
 
-                    participant.status = CallParticipant.LEFT
-                    participant.left_at = now
+                # ===============================================
+                # GROUP CALL
+                # ===============================================
+
+                else:
+
+                    anyone_joined = (
+                        CallParticipant.objects
+                        .filter(
+                            call=call,
+                            status=CallParticipant.JOINED,
+                        )
+                        .exists()
+                    )
+
+                    if not anyone_joined:
+
+                        call.status = (
+                            CallSession.ENDED
+                        )
+
+                        call.ended_at = now
+
+                        call.save(
+                            update_fields=[
+                                "status",
+                                "ended_at",
+                            ]
+                        )
+
+                        # Nobody remains in the room.
+                        # Stop remaining ringing/invited states.
+                        CallParticipant.objects.filter(
+                            call=call,
+                            status__in=[
+                                CallParticipant.RINGING,
+                                CallParticipant.INVITED,
+                            ],
+                        ).update(
+                            status=CallParticipant.LEFT,
+                            left_at=now,
+                        )
+
+        # =========================================================
+        # REALTIME EVENT
+        # =========================================================
 
         event_data = {
             "type": "call_status_updated",
             **_serialize_call(call),
+
             "action": action,
+
             "updated_by": request.user.id,
-            "participant_status": participant.status,
+
+            "participant_status":
+                participant.status,
         }
 
-        _broadcast_call_event(call.conversation_id, event_data)
+        _broadcast_call_event(
+            call.conversation_id,
+            event_data,
+        )
+
+        print(
+            "CALL STATUS:",
+            call.id,
+            "ACTION:",
+            action,
+            "STATUS:",
+            call.status,
+            "USER:",
+            request.user.id,
+        )
 
         return Response(
             {
                 "success": True,
                 **_serialize_call(call),
-                "participant_status": participant.status,
-            }
+                "participant_status":
+                    participant.status,
+            },
+            status=status.HTTP_200_OK,
         )
 
 class ActiveGroupCallView(APIView):
