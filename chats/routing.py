@@ -1,5 +1,5 @@
-from django.urls import path
-
+from django.urls import path,re_path
+from .realtime_counsumers import RealtimeConsumer
 from .consumers import ChatConsumer, GlobalChatConsumer
 from .signaling_consumer import (
     CallSignalingConsumer,
@@ -30,4 +30,5 @@ websocket_urlpatterns = [
         "ws/call/<int:conversation_id>/",
         CallSignalingConsumer.as_asgi(),
     ),
+    re_path(r"ws/realtime/$", RealtimeConsumer.as_asgi()),
 ]

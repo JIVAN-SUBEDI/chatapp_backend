@@ -2329,45 +2329,33 @@ class UpdateCallStatusView(APIView):
                 # GROUP CALL
                 # ===============================================
 
-                else:
+            else:
+                # Group call: current participant has already been marked LEFT.
 
-                    anyone_joined = (
-                        CallParticipant.objects
-                        .filter(
-                            call=call,
-                            status=CallParticipant.JOINED,
-                        )
-                        .exists()
+                remaining_joined = CallParticipant.objects.filter(
+                    call=call,
+                    status=CallParticipant.JOINED,
+                ).exclude(
+                    user=request.user,
+                ).exists()
+
+                if not remaining_joined:
+                    call.status = CallSession.ENDED
+                    call.ended_at = now
+                    call.save(
+                        update_fields=["status", "ended_at"]
                     )
 
-                    if not anyone_joined:
-
-                        call.status = (
-                            CallSession.ENDED
-                        )
-
-                        call.ended_at = now
-
-                        call.save(
-                            update_fields=[
-                                "status",
-                                "ended_at",
-                            ]
-                        )
-
-                        # Nobody remains in the room.
-                        # Stop remaining ringing/invited states.
-                        CallParticipant.objects.filter(
-                            call=call,
-                            status__in=[
-                                CallParticipant.RINGING,
-                                CallParticipant.INVITED,
-                            ],
-                        ).update(
-                            status=CallParticipant.LEFT,
-                            left_at=now,
-                        )
-
+                    CallParticipant.objects.filter(
+                        call=call,
+                        status__in=[
+                            CallParticipant.RINGING,
+                            CallParticipant.INVITED,
+                        ],
+                    ).update(
+                        status=CallParticipant.LEFT,
+                        left_at=now,
+                    )
         # =========================================================
         # REALTIME EVENT
         # =========================================================
