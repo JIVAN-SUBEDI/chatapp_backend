@@ -173,6 +173,15 @@ def send_incoming_call_push(*, token, call_data):
                 if call_data.get("is_video_call")
                 else "false"
             ),
+
+            # Fields the new app reads directly.
+            "is_video": (
+                "true" if call_data.get("is_video_call") else "false"
+            ),
+            "is_group": (
+                "true" if call_data.get("is_group_call") else "false"
+            ),
+            "avatar": str(call_data.get("caller_avatar", "")),
         }
 
         print("📦 FCM CALL DATA:", data)
@@ -378,26 +387,37 @@ def send_message_push(*, token, message_data):
                     "",
                 )
             ),
+
+            # The app builds the notification itself (WhatsApp style with
+            # Reply / Mark as read), so title/body travel in data.
+            "title": title,
+            "body": body,
+            "conversation_name": str(
+                message_data.get("conversation_name", "") or ""
+            ),
+            "is_group": (
+                "true" if message_data.get("is_group") else "false"
+            ),
         }
 
+        # DATA-ONLY on Android: the app shows the notification with a Reply
+        # button. iOS still gets a normal alert (apns block).
         message = messaging.Message(
             token=str(token),
-
-            notification=messaging.Notification(
-                title=title,
-                body=body,
-            ),
 
             data=data,
 
             android=messaging.AndroidConfig(
                 priority="high",
+                ttl=timedelta(hours=24),
+            ),
 
-                notification=messaging.AndroidNotification(
-                    channel_id="message_channel",
-                    priority="high",
-                    sound="default",
-                    click_action="FLUTTER_NOTIFICATION_CLICK",
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        alert=messaging.ApsAlert(title=title, body=body),
+                        sound="default",
+                    ),
                 ),
             ),
         )
@@ -456,4 +476,36 @@ def send_message_push(*, token, message_data):
         print("TOKEN:", _short_token(token))
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
+        return None
+
+# ============================================================
+# CALL UPDATE PUSH (stop ringing / missed call)
+# ============================================================
+
+def send_call_update_push(*, token, data):
+    """Data-only push so a ringing phone (app closed) stops ringing and,
+    for missed calls, shows a "Missed call" notification."""
+    if not token:
+        return None
+    try:
+        init_firebase()
+        message = messaging.Message(
+            token=str(token),
+            data={k: ("" if v is None else str(v)) for k, v in data.items()},
+            android=messaging.AndroidConfig(
+                priority="high",
+                ttl=timedelta(minutes=10),
+            ),
+        )
+        response = messaging.send(message)
+        print("✅ CALL UPDATE FCM SENT:", data.get("type"), _short_token(token))
+        return response
+    except (messaging.UnregisteredError, messaging.SenderIdMismatchError,
+            firebase_exceptions.InvalidArgumentError,
+            firebase_exceptions.NotFoundError) as e:
+        print("❌ CALL UPDATE FCM BAD TOKEN:", repr(e))
+        delete_bad_fcm_token(token)
+        return None
+    except Exception as e:
+        print("❌ CALL UPDATE FCM FAILED:", repr(e))
         return None

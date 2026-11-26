@@ -248,6 +248,34 @@ def push_incoming(user_ids, call_data):
     return sent
 
 
+def push_call_update(user_ids, data):
+    """FCM to phones whose app may be closed: stop ringing / missed call."""
+    from .firebase import send_call_update_push
+
+    ids = [u for u in set(user_ids or []) if u]
+    if not ids:
+        return 0
+    sent = 0
+    for item in UserFCMToken.objects.filter(user_id__in=ids).iterator():
+        if send_call_update_push(token=item.token, data=data):
+            sent += 1
+    return sent
+
+
+def _call_push_data(call, push_type, reason=""):
+    group = call.conversation.type == Conversation.GROUP
+    return {
+        "type": push_type,
+        "call_id": call.id,
+        "conversation_id": call.conversation_id,
+        "reason": reason,
+        "caller_name": user_display_name(call.caller) if call.caller else "",
+        "conversation_name": call.conversation.name or "",
+        "is_video": "true" if call.call_type == CallSession.VIDEO else "false",
+        "is_group": "true" if group else "false",
+    }
+
+
 def _close_call(call, status, now):
     """Mark a call finished and settle every participant row."""
     call.status = status
@@ -278,6 +306,14 @@ def _emit_ended(call, reason, by=None):
         "type": "call_status_updated", **serialize_call(call), "action": reason,
         "updated_by": by,
     })
+
+    # Never answered → phones may still be ringing with the app closed.
+    if call.answered_at is None:
+        ringing = [u for u in participant_ids(call) if u not in (call.caller_id, by)]
+        missed = reason in ("timeout", "cancelled", "missed")
+        push_call_update(
+            ringing, _call_push_data(call, "call_missed" if missed else "call_ended", reason)
+        )
 
 
 # ═════════════════════════════ ring timeout ═════════════════════════════
@@ -519,6 +555,8 @@ def join_call(user, call_id, request=None, exclude_channel=None, reply_event="ca
     notify_users([user.id], "call_answered_elsewhere", {
         "call_id": str(call.id), "callId": str(call.id),
     }, call.conversation_id, exclude_channel=exclude_channel)
+    if not was_joined and user.id != call.caller_id:
+        push_call_update([user.id], _call_push_data(call, "call_answered_elsewhere"))
 
     broadcast_legacy(call.conversation_id, {
         "type": "call_participant_joined",
@@ -576,6 +614,7 @@ def decline_call(user, call_id, reason="declined", exclude_channel=None, as_miss
     notify_users([user.id], "call_answered_elsewhere", {
         "call_id": str(call.id), "callId": str(call.id), "declined": True,
     }, call.conversation_id, exclude_channel=exclude_channel)
+    push_call_update([user.id], _call_push_data(call, "call_answered_elsewhere", "declined"))
 
     if end_status:
         _emit_ended(call, "busy" if reason == "busy" else ("missed" if as_missed else "declined"),
@@ -623,6 +662,7 @@ def cancel_call(user, call_id, reason="cancelled", strict=False):
         notify_users(ring_stopped, "call_ring_stopped", {
             "call_id": str(call.id), "callId": str(call.id), "reason": reason,
         }, call.conversation_id)
+        push_call_update(ring_stopped, _call_push_data(call, "call_missed", reason))
     return {"event": "call_cancel_ok", **public_call(call)}
 
 
